@@ -12,15 +12,20 @@ local coroutine_status = coroutine.status
 local hook_Add = hook.Add
 local hook_Remove = hook.Remove
 local render_SetMaterial = render.SetMaterial
+local HoloEffects = ENT.HoloEffects
 local dynamicPropBakeCvar = MapCache.dynamicPropBakeCvar
 local CACHE_GENERATION = MapCache.CACHE_GENERATION
 local staticPropBakeMaterial = MapCache.staticPropBakeMaterial
 local addStaticPropBakeVert = MapCache.addStaticPropBakeVert
-local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
+local propOrderByModel = MapCache.propOrderByModel
+local buildMeshFromFlatTriangles = MapCache.buildMeshFromFlatTriangles
+local FLAT_VERTEX_STRIDE = MapCache.FLAT_VERTEX_STRIDE
 local DYNAMIC_PROP_BAKE_HOOK = 'holo_table_3d.dynamic_prop_bake'
 local DYNAMIC_PROP_SCAN_INTERVAL = 1.0
+-- Seconds the bakeable prop_dynamic set must stay unchanged before a rebuild.
+local DYNAMIC_PROP_REBUILD_SETTLE = 5.0
 local DYNAMIC_PROP_BAKE_FRAME_BUDGET = 0.006
-local DYNAMIC_PROP_BAKE_MAX_VERTS = 12000
+local DYNAMIC_PROP_BAKE_MAX_VERTS = 30000
 local DYNAMIC_PROP_BAKE_PER_VERT_SEC = 0.5e-6
 MapCache.dynamicPropBake = nil
 
@@ -35,6 +40,15 @@ end
 
 local DYNAMIC_PROP_MOVE_EPS_SQR = 1
 local DYNAMIC_PROP_ANGLE_EPS = 1
+
+--- The map-dressing layer must never absorb props spawned by addons. LVS and
+--- several other vehicle bases attach prop_dynamic visual children at runtime;
+--- baking those duplicates the vehicle in the map mesh and can add hundreds of
+--- thousands of vertices every time the child moves.
+local function isMapDynamicProp(ent)
+    return IsValid(ent) and ent:GetClass() == 'prop_dynamic'
+        and ent:MapCreationID() >= 0
+end
 
 --- True if a prop has moved / rotated / changed model or skin since last seen.
 --- @param a table? Previous snapshot record.
@@ -61,7 +75,7 @@ local function dynamicPropSnapshot()
     local list = {}
     local sig = {}
     for _, ent in ents.Iterator() do
-        if ent:GetClass() ~= 'prop_dynamic' then continue end
+        if not isMapDynamicProp(ent) then continue end
         local model = ent:GetModel()
         if not model or model == '' then continue end
         local pos = ent:GetPos()
@@ -114,7 +128,6 @@ local function startDynamicPropBake(snapshot, signature)
     MapCache.dynamicPropBake.pendingVerts = 0
 
     MapCache.dynamicPropBake.co = coroutine_create(function()
-        local modelCache = {}
         local groups = {}
         local deadline = SysTime() + DYNAMIC_PROP_BAKE_FRAME_BUDGET
 
@@ -130,18 +143,19 @@ local function startDynamicPropBake(snapshot, signature)
 
         local function flushGroup(group)
             local verts = group.verts
-            local n = #verts
-            if n == 0 then return end
-            if SysTime() + n * DYNAMIC_PROP_BAKE_PER_VERT_SEC > deadline then
+            local valueCount = #verts
+            if valueCount == 0 then return end
+            local vertCount = valueCount / FLAT_VERTEX_STRIDE
+            if SysTime() + vertCount * DYNAMIC_PROP_BAKE_PER_VERT_SEC > deadline then
                 coroutine_yield()
                 bumpDeadline()
             end
-            local msh = buildMeshFromTriangles(verts)
+            local msh = buildMeshFromFlatTriangles(verts)
             MapCache.dynamicPropBake.pendingMeshes[#MapCache.dynamicPropBake.pendingMeshes + 1] = {
                 mat = group.mat,
                 mesh = msh,
             }
-            MapCache.dynamicPropBake.pendingVerts = MapCache.dynamicPropBake.pendingVerts + n
+            MapCache.dynamicPropBake.pendingVerts = MapCache.dynamicPropBake.pendingVerts + vertCount
             group.verts = {}
             budgetYield()
         end
@@ -155,14 +169,18 @@ local function startDynamicPropBake(snapshot, signature)
             return group
         end
 
-        for i = 1, #snapshot do
+        -- Model-ordered so only one model's mesh data is alive at a time.
+        local order, keys = propOrderByModel(snapshot)
+        local currentModelKey, modelMeshes = nil, false
+        for oi = 1, #order do
             budgetYield()
+            local i = order[oi]
             local rec = snapshot[i]
-            local modelKey = rec.model .. '|skin=' .. tostring(rec.skin)
-            local modelMeshes = modelCache[modelKey]
-            if modelMeshes == nil then
+            if keys[i] ~= currentModelKey then
+                currentModelKey = keys[i]
+                modelMeshes = false
+                budgetYield()
                 modelMeshes = util.GetModelMeshes(rec.model, 0, 0, rec.skin) or false
-                modelCache[modelKey] = modelMeshes
             end
             if not modelMeshes then continue end
 
@@ -182,7 +200,7 @@ local function startDynamicPropBake(snapshot, signature)
                 local out = group.verts
                 for vi = 1, #tris do
                     addStaticPropBakeVert(out, tris[vi], rec.pos, fx, fy, fz, rx, ry, rz, ux, uy, uz)
-                    if #out >= DYNAMIC_PROP_BAKE_MAX_VERTS then
+                    if #out >= DYNAMIC_PROP_BAKE_MAX_VERTS * FLAT_VERTEX_STRIDE then
                         flushGroup(group)
                         out = group.verts
                     elseif vi % 768 == 0 then
@@ -224,6 +242,7 @@ function MapCache.startDynamicPropBakeWatch()
         if MapCache.anyClipCoroutineActive() then return end
 
         if MapCache.dynamicPropBake.state == 'building' then
+            if not MapCache.claimBackgroundSlot('dynamic_bake') then return end
             local ok, err = coroutine_resume(MapCache.dynamicPropBake.co)
             if not ok then
                 ErrorNoHaltWithStack(err)
@@ -237,6 +256,7 @@ function MapCache.startDynamicPropBakeWatch()
             if coroutine_status(MapCache.dynamicPropBake.co) == 'dead' then
                 MapCache.destroyMeshList(MapCache.dynamicPropBake.meshes)
                 MapCache.dynamicPropBake.meshes = MapCache.dynamicPropBake.pendingMeshes or {}
+                MapCache.sortMeshListByMaterial(MapCache.dynamicPropBake.meshes)
                 MapCache.dynamicPropBake.signature = MapCache.dynamicPropBake.pendingSignature
                 MapCache.dynamicPropBake.props = MapCache.dynamicPropBake.pendingProps or 0
                 MapCache.dynamicPropBake.outputVerts = MapCache.dynamicPropBake.pendingVerts or 0
@@ -254,12 +274,27 @@ function MapCache.startDynamicPropBakeWatch()
             return
         end
 
-        if SysTime() < (MapCache.dynamicPropBake.nextScan or 0) then return end
-        MapCache.dynamicPropBake.nextScan = SysTime() + DYNAMIC_PROP_SCAN_INTERVAL
+        local bake = MapCache.dynamicPropBake
+        local now = SysTime()
+        if now < (bake.nextScan or 0) then return end
+        bake.nextScan = now + DYNAMIC_PROP_SCAN_INTERVAL
         local snapshot, signature = dynamicPropSnapshot()
-        if signature ~= MapCache.dynamicPropBake.signature then
-            startDynamicPropBake(snapshot, signature)
+        if signature == bake.signature then
+            bake.candidateSignature = nil
+            return
         end
+        -- Debounce: movers are discovered one scan at a time, and each
+        -- discovery changes the signature. Rebuilding on every change
+        -- re-baked ~500k verts several times in a row on gm_gmall_2, so
+        -- wait until the bakeable set has been stable for a while.
+        if signature ~= bake.candidateSignature then
+            bake.candidateSignature = signature
+            bake.candidateSince = now
+            return
+        end
+        if now - (bake.candidateSince or now) < DYNAMIC_PROP_REBUILD_SETTLE then return end
+        bake.candidateSignature = nil
+        startDynamicPropBake(snapshot, signature)
     end)
 end
 
@@ -297,6 +332,27 @@ local function deferredRemoveEntity(ent)
     end)
 end
 
+local function refreshDynamicPropMirror(fresh, ent)
+    if not isMapDynamicProp(ent) then return end
+    local idx = ent:EntIndex()
+    local rec = fresh[idx]
+    local model = ent:GetModel()
+    if not model or model == '' then
+        if rec and rec.csent then deferredRemoveEntity(rec.csent) end
+        fresh[idx] = nil
+        return
+    end
+    if rec and rec.model == model then return end
+
+    if rec and rec.csent then deferredRemoveEntity(rec.csent) end
+    local cs = makeDynamicPropMirror(model)
+    if cs then
+        fresh[idx] = { ent = ent, csent = cs, model = model }
+    else
+        fresh[idx] = nil
+    end
+end
+
 function ENT:CleanupDynamicProps()
     local selfTbl = self:GetTable()
     if not selfTbl.DynamicPropMirrors then return end
@@ -322,7 +378,7 @@ local function refreshDynamicPropMirrors(self, onlyUnbaked)
     local old = selfTbl.DynamicPropMirrors or {}
     local unbaked = MapCache.dynamicPropBake and MapCache.dynamicPropBake.unbaked
     for _, rec in pairs(old) do
-        local keep = IsValid(rec.ent)
+        local keep = isMapDynamicProp(rec.ent)
             and (not onlyUnbaked or (unbaked and unbaked[rec.ent:EntIndex()]))
         if keep then
             fresh[rec.ent:EntIndex()] = rec
@@ -331,24 +387,16 @@ local function refreshDynamicPropMirrors(self, onlyUnbaked)
         end
     end
 
-    for _, ent in ents.Iterator() do
-        if ent:GetClass() ~= 'prop_dynamic' then continue end
-        if onlyUnbaked and not (unbaked and unbaked[ent:EntIndex()]) then continue end
-        local idx = ent:EntIndex()
-        local rec = fresh[idx]
-        local model = ent:GetModel()
-        if not model or model == '' then
-            if rec and rec.csent then deferredRemoveEntity(rec.csent) end
-            fresh[idx] = nil
-            continue
+    if onlyUnbaked then
+        -- The global bake watcher already identifies movers by EntIndex, so
+        -- per-table refreshes need not scan the full world entity list.
+        for idx in pairs(unbaked or {}) do
+            refreshDynamicPropMirror(fresh, Entity(idx))
         end
-        if not rec or rec.model ~= model then
-            if rec and rec.csent then deferredRemoveEntity(rec.csent) end
-            local cs = makeDynamicPropMirror(model)
-            if cs then
-                fresh[idx] = { ent = ent, csent = cs, model = model }
-            else
-                fresh[idx] = nil
+    else
+        for _, ent in ents.Iterator() do
+            if isMapDynamicProp(ent) then
+                refreshDynamicPropMirror(fresh, ent)
             end
         end
     end
@@ -356,6 +404,25 @@ local function refreshDynamicPropMirrors(self, onlyUnbaked)
     selfTbl.DynamicPropMirrors = fresh
     selfTbl.DynamicPropMirrorTime = SysTime()
     return fresh
+end
+
+local function drawDynamicBakeMeshes(meshes)
+    local lastMat
+    for i = 1, #meshes do
+        local item = meshes[i]
+        if item.mesh then
+            local mat = item.mat
+            if mat ~= lastMat then
+                render_SetMaterial(mat)
+                lastMat = mat
+            end
+            item.mesh:Draw()
+        end
+    end
+end
+
+local function drawEffectDynamicBakeMeshes(meshes)
+    HoloEffects.DrawMeshList(meshes)
 end
 
 --- Draws the baked prop_dynamic bake inside the holo scene matrix. Returns
@@ -372,15 +439,14 @@ function ENT:DrawBakedDynamicProps()
     end
     if MapCache.dynamicPropBake.state ~= 'ready' or not MapCache.dynamicPropBake.meshes then return true end
 
+    local selfTbl = self:GetTable()
+    if HoloEffects.ArePropsEnabled() and HoloEffects.BeginDraw(selfTbl, true) then
+        local effectOk, effectErr = pcall(drawEffectDynamicBakeMeshes, MapCache.dynamicPropBake.meshes)
+        if HoloEffects.EndDraw(effectOk, effectErr) then return true end
+    end
+
     render.SuppressEngineLighting(true)
-    local ok, err = pcall(function()
-        for _, item in ipairs(MapCache.dynamicPropBake.meshes) do
-            if item.mesh then
-                render_SetMaterial(item.mat)
-                item.mesh:Draw()
-            end
-        end
-    end)
+    local ok, err = pcall(drawDynamicBakeMeshes, MapCache.dynamicPropBake.meshes)
     render.SuppressEngineLighting(false)
 
     if not ok then
@@ -444,7 +510,9 @@ function ENT:DrawDynamicProps(onlyUnbaked)
         csent:SetAngles(scratchAng)
         csent:SetModelScale(invScale, 0)
         csent:SetupBones()
-        csent:DrawModel()
+        if not HoloEffects.DrawPropModel(selfTbl, csent, ent:EntIndex() * 0.17) then
+            csent:DrawModel()
+        end
     end
     render.SuppressEngineLighting(false)
 end

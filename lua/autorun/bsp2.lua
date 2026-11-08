@@ -183,13 +183,24 @@ end
 if CLIENT then
     local MATERIALS = {}
     local MATERIALS_READY = false
+    -- basetexture name -> shared fallback material.
+    local FALLBACK_BY_TEXTURE = {}
 
     local function destroyModelInfo()
         MATERIALS = {}
         MATERIALS_READY = false
     end
 
-    --- Returns the per-texinfo UnlitGeneric fallback material, cached on the texinfo.
+    --- Returns the UnlitGeneric fallback material for a texinfo, cached on the
+    --- texinfo as `_holoBsp2Material` and shared by every texinfo with the same
+    --- basetexture.
+    ---
+    --- The name must be stable and derived from the texture: CreateMaterial
+    --- names go into a process-wide engine symbol table (16-bit, 65535 entries)
+    --- that survives map changes. Naming per texinfo by table address added
+    --- ~15k new names on every gm_gmall_2 load and crashed the game with
+    --- "CUtlRBTree<CUtlSymbolTable::CStringPoolIndex> overflow" after a few
+    --- map changes in one session.
     --- @param tinfo table
     --- @return IMaterial
     local function materialForTexInfo(tinfo)
@@ -198,21 +209,26 @@ if CLIENT then
         local mat = Material(tinfo.texdata.material)
         local btn = mat:GetTexture('$basetexture')
         if btn then
-            mat = CreateMaterial(tostring(tinfo) .. '_texinfo', 'UnlitGeneric', {
-                ['$basetexture'] = btn:GetName(),
-                ['$detailscale'] = 1,
-                ['$reflectivity'] = util.StringToType(tostring(tinfo.texdata.reflectivity), 'Vector'),
-                ['$model'] = 1,
-            })
+            local textureName = btn:GetName()
+            local fallback = FALLBACK_BY_TEXTURE[textureName]
+            if not fallback then
+                fallback = CreateMaterial('holo_bsp2_' .. util.CRC(textureName), 'UnlitGeneric', {
+                    ['$basetexture'] = textureName,
+                    ['$detailscale'] = 1,
+                    ['$model'] = 1,
+                })
+                FALLBACK_BY_TEXTURE[textureName] = fallback
+            end
+            mat = fallback
         end
 
         tinfo._holoBsp2Material = mat
         return mat
     end
 
-    --- Builds the per-texinfo fallback material list and runs CurrentBSPReady.
-    --- cl_map.lua owns all visible rendering; the only contract here is the
-    --- material list keyed by 'tostring(tinfo) .. _texinfo'.
+    --- Builds the per-texinfo fallback materials (see materialForTexInfo) and
+    --- runs CurrentBSPReady. cl_map.lua owns all visible rendering; consumers
+    --- read each texinfo's `_holoBsp2Material` once GetModelInfo is ready.
     local function buildModelInfo()
         destroyModelInfo()
 

@@ -22,6 +22,8 @@ local staticPropBakeModeCvar = CreateClientConVar('holo_table_staticprop_bake_mo
     'Static prop bake mode: 0 legacy, 1 global all-in bake, 2 per-prop baked cull, 3 global GPU-clipped bake.')
 local dynamicPropBakeCvar = CreateClientConVar('holo_table_dynamicprop_bake', '1', true, false,
     'Use baked prop_dynamic meshes for holo table views.')
+local shaderClipCvar = CreateClientConVar('holo_table_shader_clip', '1', true, false,
+    'Experimental: draw the cached all-in world mesh with GPU cylinder clipping.')
 
 -- Sub-pixel cull threshold in holo units (0.5 ≈ 1 px at typical viewing).
 local PROP_SUBPIXEL_THRESHOLD = 0.5
@@ -70,6 +72,19 @@ local function getPropDrawEnt(name)
         propEntCache[name] = cs
         return cs
     end
+    return nil
+end
+
+--- Cache-only lookups for draw paths that must not trigger model loads.
+--- @param name string
+--- @return { center: Vector, radius: number }?
+local function peekPropBounds(name) return propBoundsCache[name] end
+
+--- @param name string
+--- @return Entity?
+local function peekPropDrawEnt(name)
+    local cs = propEntCache[name]
+    if IsValid(cs) then return cs end
     return nil
 end
 
@@ -157,9 +172,11 @@ end
 -- MaterialVarFlags bits propagated from source LightmappedGeneric onto the
 -- holo wrapper so glass / fences / foliage render with their alpha intact.
 local MATFLAG_ALPHATEST   = 0x100
+local MATFLAG_NOCULL      = 0x2000
 local MATFLAG_TRANSLUCENT = 0x200000
 
 local unlitWrapCache = {}
+local shaderClipMaterialCache = {}
 
 --- Wraps src's $basetexture in a runtime UnlitGeneric so the holo can
 --- render it without a lightmap. Cached per (basetexture, alpha-flags).
@@ -188,6 +205,63 @@ local function unlitWrap(src, translucent, alphaTest)
     return m
 end
 
+--- Wraps a map material with the experimental GPU cylinder-clip shader.
+--- The shader binaries are optional; callers fall back when creation fails.
+--- @param src IMaterial
+--- @return IMaterial?
+local shaderClipBySrc = setmetatable({}, { __mode = 'k' })
+local function shaderClipMaterial(src)
+    -- Per-source cache: called for every world mesh every frame; the keyed
+    -- lookup below reads material vars back and builds a string each call.
+    local bySrc = src and shaderClipBySrc[src]
+    if bySrc ~= nil then return bySrc or nil end
+    local result = MapCache.shaderClipMaterialUncached(src)
+    if src then shaderClipBySrc[src] = result or false end
+    return result
+end
+
+function MapCache.shaderClipMaterialUncached(src)
+    local btn = src and src:GetTexture('$basetexture')
+    if not btn then return nil end
+
+    local flags = src:GetInt('$flags') or 0
+    local translucent = bit_band(flags, MATFLAG_TRANSLUCENT) ~= 0
+    local alphaTest = bit_band(flags, MATFLAG_ALPHATEST) ~= 0
+    local noCull = bit_band(flags, MATFLAG_NOCULL) ~= 0
+    local textureName = btn:GetName()
+    local cacheKey = textureName .. (translucent and '|t' or '')
+        .. (alphaTest and '|a' or '') .. (noCull and '|n' or '')
+    local cached = shaderClipMaterialCache[cacheKey]
+    if cached ~= nil then return cached or nil end
+
+    local kv = {
+        ['$pixshader'] = 'holotable_clip_ps20b',
+        ['$vertexshader'] = 'holotable_clip_vs20',
+        -- Some BSP adapter textures have no directly loadable material path.
+        -- Create against a known texture, then bind the existing ITexture.
+        ['$basetexture'] = 'models/debug/debugwhite',
+        ['$cull'] = noCull and '0' or '1',
+        ['$depthtest'] = '1',
+        ['$vertexnormal'] = '1',
+        ['$vertexcolor'] = '1',
+    }
+    if translucent then
+        kv['$alphablend'] = '1'
+        kv['$writealpha'] = '1'
+    end
+    if alphaTest then kv['$alphatested'] = '1' end
+
+    local mat = CreateMaterial('holo_table_shader_clip_' .. util.CRC(cacheKey),
+        'screenspace_general', kv)
+    if not mat or mat:IsError() then
+        shaderClipMaterialCache[cacheKey] = false
+        return nil
+    end
+    mat:SetTexture('$basetexture', btn)
+    shaderClipMaterialCache[cacheKey] = mat
+    return mat
+end
+
 -- Per coroutine.resume budget for the async build.
 local CLIP_FRAME_BUDGET = 0.004
 
@@ -214,7 +288,7 @@ end
 --- @param matByTexinfo table<string, IMaterial>
 --- @return IMaterial mat
 --- @return boolean skip True if the material's basetexture is in the filter set.
-local function resolveMat(tinfo, matByTexinfo)
+local function resolveMat(tinfo, _matByTexinfo)
     checkCacheGen()
     local m = matCacheGlobal[tinfo]
     if m ~= nil then return m, skipCacheGlobal[tinfo] end
@@ -224,7 +298,7 @@ local function resolveMat(tinfo, matByTexinfo)
         local srcFlags = src:GetInt('$flags') or 0
         local trans     = bit_band(srcFlags, MATFLAG_TRANSLUCENT) ~= 0
         local alphaTest = bit_band(srcFlags, MATFLAG_ALPHATEST)   ~= 0
-        local fb = matByTexinfo[tostring(tinfo) .. '_texinfo']
+        local fb = tinfo._holoBsp2Material
         local fbBtn = fb and fb:GetTexture('$basetexture')
         local fbOk = fbBtn and not filter[fbBtn:GetName()]
         if trans or alphaTest then
@@ -269,6 +343,15 @@ local matByTexinfoSrc = nil
 --- @param deadlineFn? fun(): number Returns SysTime deadline; yields when exceeded.
 --- @param bumpFn? fun() Called after each yield to refresh the deadline.
 --- @return table<string, IMaterial>?
+--- True once the name->IMaterial lookup is built for the current adapter
+--- material list, i.e. getMatByTexinfo() will return without doing work.
+--- @return boolean
+local function isMatByTexinfoReady()
+    if not matByTexinfoSrc then return false end
+    local mi = bsp2 and bsp2.GetModelInfo()
+    return mi ~= nil and mi.materials == matByTexinfoSrc
+end
+
 local function getMatByTexinfo(deadlineFn, bumpFn)
     local mi = bsp2 and bsp2.GetModelInfo()
     local mats = mi and mi.materials
@@ -299,9 +382,13 @@ MapCache.filter = filter
 MapCache.staticPropBakeCvar = staticPropBakeCvar
 MapCache.staticPropBakeModeCvar = staticPropBakeModeCvar
 MapCache.dynamicPropBakeCvar = dynamicPropBakeCvar
+MapCache.shaderClipCvar = shaderClipCvar
+MapCache.shaderClipMaterial = shaderClipMaterial
 MapCache.PROP_SUBPIXEL_THRESHOLD = PROP_SUBPIXEL_THRESHOLD
 MapCache.getPropBounds = getPropBounds
 MapCache.getPropDrawEnt = getPropDrawEnt
+MapCache.peekPropBounds = peekPropBounds
+MapCache.peekPropDrawEnt = peekPropDrawEnt
 MapCache.cleanupPropEntCache = cleanupPropEntCache
 MapCache.clipPolygonPlane = clipPolygonPlane
 MapCache.SURF_SKIP_MASK = SURF_SKIP_MASK
@@ -312,3 +399,4 @@ MapCache.unlitWrap = unlitWrap
 MapCache.resolveMat = resolveMat
 MapCache.resolveProj = resolveProj
 MapCache.getMatByTexinfo = getMatByTexinfo
+MapCache.isMatByTexinfoReady = isMatByTexinfoReady

@@ -22,6 +22,8 @@ local getMatByTexinfo = MapCache.getMatByTexinfo
 local resolveMat = MapCache.resolveMat
 local resolveProj = MapCache.resolveProj
 local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
+local shaderClipMaterial = MapCache.shaderClipMaterial
+local HoloEffects = ENT.HoloEffects
 
 --- Builds the clipped worldspawn mesh list. Iterates worldspawn faces only;
 --- each surviving face becomes triangles in a per-material group. Both fast
@@ -433,33 +435,160 @@ function ENT:CylinderHorizContainsMap(scale, panX, panY)
     return true
 end
 
+local CLIPPED_DRAW_MTX = Matrix()
+local CLIPPED_DRAW_SCALE_VEC = Vector()
+
+local function drawClippedMeshList(meshes)
+    local lastMat
+    for i = 1, #meshes do
+        local item = meshes[i]
+        local mat = item.mat
+        if mat ~= lastMat then
+            render_SetMaterial(mat)
+            lastMat = mat
+        end
+        item.mesh:Draw()
+    end
+end
+
+local function drawShaderClippedMeshList(meshes)
+    local lastSrc, mat
+    for i = 1, #meshes do
+        local item = meshes[i]
+        if item.mat ~= lastSrc then
+            lastSrc = item.mat
+            -- Atlas meshes already carry their atlas-shader page material.
+            mat = item.atlas and lastSrc or shaderClipMaterial(lastSrc)
+            if not mat then error('custom clip shader material unavailable') end
+            render_SetMaterial(mat)
+        end
+        item.mesh:Draw()
+    end
+end
+
+local function drawEffectClippedMap(selfTbl, meshes, matrix, exactClip)
+    if not HoloEffects.BeginDraw(selfTbl, exactClip) then return false end
+
+    cam.PushModelMatrix(matrix)
+        local ok, err = pcall(HoloEffects.DrawMeshList, meshes)
+    cam.PopModelMatrix()
+
+    return HoloEffects.EndDraw(ok, err)
+end
+
+local function drawShaderClippedMap(selfTbl, meshes, matrix, noClip)
+    local tablePos = selfTbl._holoTablePos
+    local axis = selfTbl._holoAxis
+    local tableAlong = tablePos.x * axis.x + tablePos.y * axis.y + tablePos.z * axis.z
+    local floorAlong = noClip and -1e9 or (tableAlong + axis.z * 25)
+    -- Worldspawn is open at the top, like the CPU clipper (walls + floor
+    -- only). The shader's third plane is an upper cap; a table-height cap
+    -- discarded everything rising above the table.
+    local topAlong = 1e9
+
+    render.SuppressEngineLighting(true)
+    render.SetModelLighting(0, tablePos.x, tablePos.y, tablePos.z)
+    render.SetModelLighting(1, axis.x, axis.y, axis.z)
+    render.SetModelLighting(2, noClip and 1e12 or 90 * 90, floorAlong, topAlong)
+    if not HoloEffects.CommitConstants() then
+        render.SuppressEngineLighting(false)
+        selfTbl.ShaderClipReady = false
+        return false
+    end
+    render.OverrideDepthEnable(true, true)
+
+    cam.PushModelMatrix(matrix)
+        local ok, err = pcall(drawShaderClippedMeshList, meshes)
+    cam.PopModelMatrix()
+
+    render.OverrideDepthEnable(false, false)
+    render.ResetModelLighting(1, 1, 1)
+    render.SuppressEngineLighting(false)
+
+    if not ok then
+        selfTbl.ShaderClipReady = false
+        if not selfTbl.ShaderClipWarned then
+            selfTbl.ShaderClipWarned = true
+            ErrorNoHaltWithStack('[holo_table] shader clip fallback: ' .. tostring(err))
+        end
+        return false
+    end
+
+    selfTbl.ShaderClipReady = true
+    selfTbl.ShaderClipWarned = nil
+    return true
+end
+
 --- Draws the cached clipped worldspawn mesh under its own scene matrix.
 --- Bounded in 3D by the build pipeline, so it draws OUTSIDE the screen-space
 --- stencil and the GPU clip prism (which would chop tall content).
 function ENT:DrawClippedMap()
     local selfTbl = self:GetTable()
-    local clippedMeshes = selfTbl.ClippedMeshes
-    if not clippedMeshes then return end
     if not self:GetMap() then return end
 
-    local m = Matrix()
+    -- GPU world path: shared world bake, exact shader clip for partial views.
+    local worldMeshes, exactClip
+    if selfTbl.WorldGpu then
+        local allIn = selfTbl.WorldAllIn == true
+        worldMeshes = MapCache.worldDrawList(selfTbl, allIn)
+        if not worldMeshes then return end
+        exactClip = not allIn
+    end
+    local clippedMeshes = selfTbl.ClippedMeshes
+    if not worldMeshes and not clippedMeshes then return end
+
+    local m = CLIPPED_DRAW_MTX
+    m:Identity()
     m:SetTranslation(selfTbl._holoOrigin)
     m:SetAngles(selfTbl._holoAngles)
-    m:Scale(Vector(selfTbl._holoInvScale, selfTbl._holoInvScale, selfTbl._holoInvScale))
+    CLIPPED_DRAW_SCALE_VEC:SetUnpacked(
+        selfTbl._holoInvScale, selfTbl._holoInvScale, selfTbl._holoInvScale)
+    m:Scale(CLIPPED_DRAW_SCALE_VEC)
 
     render.PushFilterMag(TEXFILTER.ANISOTROPIC)
     render.PushFilterMin(TEXFILTER.ANISOTROPIC)
     render.SetLightingMode(2)
 
+    if worldMeshes then
+        if MapCache.worldIsAtlas() then
+            -- Atlas pages need an atlas-aware shader even when nothing is
+            -- clipped: the effect variant when effects are on, else (or if
+            -- the effect draw failed) the plain atlas clip shader.
+            local drewEffect = HoloEffects.IsEnabled()
+                and drawEffectClippedMap(selfTbl, worldMeshes, m, exactClip)
+            if not drewEffect then drawShaderClippedMap(selfTbl, worldMeshes, m, not exactClip) end
+        elseif exactClip then
+            -- A failed shader leaves this frame's worldspawn empty (drawing
+            -- unclipped would spill outside the table); TickMapBuild falls
+            -- back to the CPU builder next frame.
+            local drewEffect = HoloEffects.IsEnabled()
+                and drawEffectClippedMap(selfTbl, worldMeshes, m, true)
+            if not drewEffect then drawShaderClippedMap(selfTbl, worldMeshes, m) end
+        elseif not (HoloEffects.IsEnabled()
+                and drawEffectClippedMap(selfTbl, worldMeshes, m, false)) then
+            cam.PushModelMatrix(m)
+                local ok, err = pcall(drawClippedMeshList, worldMeshes)
+            cam.PopModelMatrix()
+            if not ok then ErrorNoHaltWithStack('[holo_table] world draw aborted: ' .. tostring(err)) end
+        end
+        render.SetLightingMode(0)
+        render.PopFilterMin()
+        render.PopFilterMag()
+        return
+    end
+
+    if HoloEffects.IsEnabled()
+        and drawEffectClippedMap(selfTbl, clippedMeshes, m, false) then
+        render.SetLightingMode(0)
+        render.PopFilterMin()
+        render.PopFilterMag()
+        return
+    end
+
     -- pcall guards against a NULL IMesh aborting before the Pop calls run;
     -- a leaked Push per frame overflows the texture-filter stack.
     cam.PushModelMatrix(m)
-        local ok, err = pcall(function()
-            for _, item in ipairs(clippedMeshes) do
-                render_SetMaterial(item.mat)
-                item.mesh:Draw()
-            end
-        end)
+        local ok, err = pcall(drawClippedMeshList, clippedMeshes)
     cam.PopModelMatrix()
 
     render.SetLightingMode(0)

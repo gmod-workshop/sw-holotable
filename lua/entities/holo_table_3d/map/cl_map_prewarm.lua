@@ -19,15 +19,54 @@ local prewarmHookName      = 'holo_table_3d.tri_cache_prewarm'
 local prewarmCo            = nil
 local prewarmGen           = nil
 
---- True if any holo_table_3d has an active build coroutine.
+local FrameNumber = FrameNumber
+local clipActiveFrame, clipActiveResult = -1, false
+
+--- True if any holo_table_3d has an active build coroutine. Memoized per
+--- frame: every prewarm / bake Think hook asks, and ents.FindByClass
+--- allocates a fresh table each call.
 --- @return boolean
 local function anyClipCoroutineActive()
+    local frame = FrameNumber()
+    if frame == clipActiveFrame then return clipActiveResult end
+    local active = false
     for _, e in ipairs(ents.FindByClass('holo_table_3d')) do
-        if e.ClipCoroutine then return true end
+        if e.ClipCoroutine then active = true break end
     end
-    return false
+    clipActiveFrame, clipActiveResult = frame, active
+    return active
 end
 MapCache.anyClipCoroutineActive = anyClipCoroutineActive
+
+-- Background job scheduler state: one job runs per frame, round-robin.
+local bgSlotFrame = -1
+local bgLastRun = {}
+local bgLastAsk = {}
+
+--- Grants the calling background job (prewarm / bake coroutine) this
+--- frame's single background slot. Each job has its own ~6 ms budget per
+--- resume; with four jobs running at once on spawn they stacked to ~24 ms
+--- a frame and dropped gm_gmall_2 from ~170 fps to ~50 during builds.
+--- Jobs that asked within the last two frames take turns, least recently
+--- run first.
+--- @param name string Stable job id.
+--- @return boolean granted
+local function claimBackgroundSlot(name)
+    local frame = FrameNumber()
+    bgLastAsk[name] = frame
+    if bgSlotFrame == frame then return false end
+
+    local mine = bgLastRun[name] or -1
+    for other, asked in pairs(bgLastAsk) do
+        if other ~= name and frame - asked <= 2 and (bgLastRun[other] or -1) < mine then
+            return false
+        end
+    end
+    bgSlotFrame = frame
+    bgLastRun[name] = frame
+    return true
+end
+MapCache.claimBackgroundSlot = claimBackgroundSlot
 
 --- Background coroutine that walks every worldspawn face once per
 --- CACHE_GENERATION and populates face._holoCull / face._holoTris.
@@ -142,6 +181,7 @@ function MapCache.startTriCachePrewarm()
             return
         end
         if anyClipCoroutineActive() then return end
+        if not claimBackgroundSlot('tri_prewarm') then return end
 
         local ok, err = coroutine_resume(prewarmCo)
         if not ok then
@@ -193,6 +233,7 @@ function MapCache.startPropPrewarm()
             return
         end
         if anyClipCoroutineActive() then return end
+        if not claimBackgroundSlot('prop_prewarm') then return end
         local ok, err = coroutine_resume(propPrewarmCo)
         if not ok then
             ErrorNoHaltWithStack(err)

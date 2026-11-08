@@ -2,6 +2,8 @@
 -- to the projected pose for one DrawModel call. Local player: ClientsideModel
 -- mirror because first-person local-player drawing is engine-suppressed.
 
+local HoloEffects = RADAR.HoloEffects
+
 local mirrorState = _G.HOLO_TABLE_3D_PLAYER_RADAR_MIRRORS
 if mirrorState then
     for cs in pairs(mirrorState) do
@@ -15,6 +17,12 @@ local localBonePoseCvar = CreateClientConVar('holo_table_player_anim_events', '1
     'Experimental: copy the local player solved bone pose to the holo-table mirror.')
 local playerLightCvar = CreateClientConVar('holo_table_player_light', '1', true, false,
     'Brightness for holo-table player/weapon radar models when engine lighting is suppressed.')
+local PLAYER_MARKER_LOCAL = Color(119, 145, 190, 240)
+local PLAYER_MARKER_FRIENDLY = Color(100, 255, 150, 240)
+local PLAYER_MARKER_HOSTILE = Color(255, 90, 90, 240)
+local PLAYER_MARKER_NEUTRAL = Color(119, 145, 190, 240)
+local PLAYER_MODEL_NEUTRAL = Color(102, 159, 255, 240)
+local PLAYER_MARKER_RADIUS = 1.25
 
 local function beginPlayerLighting()
     local light = math.Clamp(playerLightCvar:GetFloat(), 0, 3)
@@ -27,12 +35,15 @@ local function endPlayerLighting()
     render.SuppressEngineLighting(false)
 end
 
-local function drawPlayerAndWeapon(ply)
+local function drawPlayerAndWeapon(ply, radar, modelColor, phase)
     ply:SetupBones()
-    ply:DrawModel()
+    if not HoloEffects.DrawContactModel(radar.entityTable, ply, modelColor, phase) then
+        ply:DrawModel()
+    end
 
     local wep = ply:GetActiveWeapon()
-    if IsValid(wep) then
+    if IsValid(wep) and not HoloEffects.DrawContactModel(radar.entityTable, wep,
+            modelColor, phase + 0.35) then
         wep:DrawModel()
     end
 end
@@ -197,8 +208,7 @@ end
 local function syncMirrorBodygroups(ply, cs)
     cs:SetSkin(ply:GetSkin() or 0)
 
-    for _, bg in ipairs(ply:GetBodyGroups()) do
-        local id = bg.id
+    for id = 0, ply:GetNumBodyGroups() - 1 do
         cs:SetBodygroup(id, ply:GetBodygroup(id))
     end
 end
@@ -270,15 +280,14 @@ end
 --- @param rootPos Vector
 --- @param rootAng Angle
 --- @param invScale number
-local function copyLocalBonePose(ply, mirror, rootPos, rootAng, invScale)
+--- @param sourcePos Vector
+--- @param sourceAng Angle
+local function copyLocalBonePose(ply, mirror, rootPos, rootAng, invScale, sourcePos, sourceAng)
     if not localBonePoseCvar:GetBool() then return end
 
     local cs = mirror.csent
     local boneIds = getMirrorBoneIds(ply, mirror)
     if #boneIds == 0 then return end
-
-    local sourcePos = ply:GetPos()
-    local sourceAng = ply:GetAngles()
 
     ply:SetupBones()
     cs:SetupBones()
@@ -333,8 +342,7 @@ local function syncLocalWeaponMirror(wep, weaponCs, invScale)
     weaponCs:SetSkin(wep:GetSkin() or 0)
     weaponCs:SetModelScale(wep:GetModelScale() * invScale, 0)
 
-    for _, bg in ipairs(wep:GetBodyGroups()) do
-        local id = bg.id
+    for id = 0, wep:GetNumBodyGroups() - 1 do
         weaponCs:SetBodygroup(id, wep:GetBodygroup(id))
     end
 end
@@ -388,35 +396,52 @@ end
 --- @param radar table
 --- @param ply Player
 --- @param invScale number
-local function drawProjectedLocalPlayer(radar, ply, invScale)
-    local mirror = getLocalMirror(radar, ply)
-    if not mirror then return end
-
+--- @param sourcePos Vector
+--- @param mirror table
+local function drawProjectedLocalPlayerInner(radar, ply, invScale, sourcePos, mirror,
+    markerColor, modelColor, phase)
     local cs = mirror.csent
-    if not IsValid(cs) then return end
+    syncLocalMirror(ply, mirror)
 
-    local ok, err = pcall(function()
-        syncLocalMirror(ply, mirror)
+    local sourceAng = ply:GetAngles()
+    local wpos, wang = radar:Project(sourcePos, sourceAng)
+    cs:SetPos(wpos)
+    cs:SetAngles(wang)
+    cs:SetModelScale(ply:GetModelScale() * invScale, 0)
+    cs:SetupBones()
+    copyLocalBonePose(ply, mirror, wpos, wang, invScale, sourcePos, sourceAng)
 
-        local wpos, wang = radar:Project(ply:GetPos(), ply:GetAngles())
-        cs:SetPos(wpos)
-        cs:SetAngles(wang)
-        cs:SetModelScale(ply:GetModelScale() * invScale, 0)
-        cs:SetupBones()
-        copyLocalBonePose(ply, mirror, wpos, wang, invScale)
-
+    if not HoloEffects.DrawContactModel(radar.entityTable, cs, modelColor, phase) then
         cs:DrawModel()
+    end
 
-        local activeWeapon = ply:GetActiveWeapon()
-        local weaponMirror = getLocalWeaponMirror(radar, activeWeapon)
-        local weaponCs = weaponMirror and weaponMirror.csent
-        if IsValid(weaponCs) then
-            syncLocalWeaponMirror(activeWeapon, weaponCs, invScale)
+    local activeWeapon = ply:GetActiveWeapon()
+    local weaponMirror = getLocalWeaponMirror(radar, activeWeapon)
+    local weaponCs = weaponMirror and weaponMirror.csent
+    if IsValid(weaponCs) then
+        syncLocalWeaponMirror(activeWeapon, weaponCs, invScale)
+        if weaponMirror.attachedTo ~= cs or weaponCs:GetParent() ~= cs then
             attachWeaponMirror(cs, weaponCs)
-            weaponCs:SetupBones()
+            weaponMirror.attachedTo = cs
+        end
+        weaponCs:SetupBones()
+        if not HoloEffects.DrawContactModel(radar.entityTable, weaponCs,
+            modelColor, phase + 0.35) then
             weaponCs:DrawModel()
         end
-    end)
+    end
+    HoloEffects.DrawContactMarker(radar.entityTable, wpos, markerColor,
+        math.Clamp(28 * invScale, 0.8, 2.5),
+        math.Clamp(80 * invScale, 2.5, 7), phase)
+end
+
+local function drawProjectedLocalPlayer(radar, ply, invScale, sourcePos,
+    markerColor, modelColor, phase)
+    local mirror = getLocalMirror(radar, ply)
+    if not (mirror and IsValid(mirror.csent)) then return end
+
+    local ok, err = pcall(drawProjectedLocalPlayerInner, radar, ply, invScale,
+        sourcePos, mirror, markerColor, modelColor, phase)
 
     if not ok then
         ErrorNoHaltWithStack('[holo_table] local player radar draw aborted: ' .. tostring(err))
@@ -428,8 +453,9 @@ end
 --- @param radar table
 --- @param ply Player
 --- @param invScale number
-local function drawProjectedPlayer(radar, ply, invScale)
-    local oldPos = ply:GetPos()
+--- @param oldPos Vector
+local function drawProjectedPlayer(radar, ply, invScale, oldPos, markerColor,
+    modelColor, phase)
     local oldAng = ply:GetAngles()
     local oldScale = ply:GetModelScale()
 
@@ -447,9 +473,12 @@ local function drawProjectedPlayer(radar, ply, invScale)
         wep:SetModelScale(oldWepScale * invScale, 0)
     end
 
-    local ok, err = pcall(function()
-        drawPlayerAndWeapon(ply)
-    end)
+    local ok, err = pcall(drawPlayerAndWeapon, ply, radar, modelColor, phase)
+    if ok then
+        HoloEffects.DrawContactMarker(radar.entityTable, wpos, markerColor,
+            math.Clamp(28 * invScale, 0.8, 2.5),
+            math.Clamp(80 * invScale, 2.5, 7), phase)
+    end
 
     if IsValid(wep) and oldWepScale then
         wep:SetModelScale(oldWepScale, 0)
@@ -464,26 +493,112 @@ local function drawProjectedPlayer(radar, ply, invScale)
     end
 end
 
+local PLAYER_VIS_RADIUS = 96
+
+local function playerMarkerColor(radar, ply, localPly)
+    if ply == localPly then
+        return HoloEffects.GetHologramColor(PLAYER_MARKER_LOCAL, 240)
+    end
+    local tableTeam = radar:GetEntity():GetTeam()
+    local playerTeam = ply:Team()
+    if tableTeam == 0 or playerTeam == 0 then
+        return HoloEffects.GetHologramColor(PLAYER_MARKER_NEUTRAL, 240)
+    end
+    return tableTeam == playerTeam and PLAYER_MARKER_FRIENDLY or PLAYER_MARKER_HOSTILE
+end
+
+local function playerModelColor(radar, ply, localPly)
+    -- Local identification stays in the label, not the hologram tint.
+    if ply == localPly then
+        return HoloEffects.GetHologramFillColor(PLAYER_MODEL_NEUTRAL, 240)
+    end
+    local tableTeam = radar:GetEntity():GetTeam()
+    local playerTeam = ply:Team()
+    if tableTeam == 0 or playerTeam == 0 then
+        return HoloEffects.GetHologramFillColor(PLAYER_MODEL_NEUTRAL, 240)
+    end
+    return tableTeam == playerTeam and PLAYER_MARKER_FRIENDLY
+        or PLAYER_MARKER_HOSTILE
+end
+
+local function playerContactStatus(radar, ply, localPly)
+    if ply == localPly then return 'LOCAL' end
+    local tableTeam = radar:GetEntity():GetTeam()
+    local playerTeam = ply:Team()
+    if tableTeam == 0 or playerTeam == 0 then return 'NEUTRAL' end
+    return tableTeam == playerTeam and 'FRIENDLY' or 'HOSTILE'
+end
+
+local function drawPlayerMarkers(radar)
+    local localPly = LocalPlayer()
+    render.SetColorMaterial()
+    for _, ply in player.Iterator() do
+        if not (IsValid(ply) and ply:Alive()) then continue end
+        local pos = ply:GetPos()
+        if not radar:IsVisible(pos, PLAYER_VIS_RADIUS) then continue end
+        render.DrawSphere(radar:Project(pos), PLAYER_MARKER_RADIUS, 8, 8,
+            playerMarkerColor(radar, ply, localPly))
+    end
+end
+
+local function drawPlayers(radar, invScale)
+    local localPly = LocalPlayer()
+    local now = CurTime()
+    radar.Seen = radar.Seen or {}
+    for _, ply in player.Iterator() do
+        if not IsValid(ply) then continue end
+        if not ply:Alive() then continue end
+        local pos = ply:GetPos()
+        if not radar:IsVisible(pos, PLAYER_VIS_RADIUS) then continue end
+
+        local color = playerMarkerColor(radar, ply, localPly)
+        local modelColor = playerModelColor(radar, ply, localPly)
+        local phase = ply:EntIndex() * 0.73
+
+        if ply == localPly then
+            drawProjectedLocalPlayer(radar, ply, invScale, pos, color,
+                modelColor, phase)
+        else
+            drawProjectedPlayer(radar, ply, invScale, pos, color,
+                modelColor, phase)
+        end
+
+        local seen = radar.Seen[ply:EntIndex()]
+        if not seen or seen.ent ~= ply then
+            seen = { ent = ply, time = now }
+            radar.Seen[ply:EntIndex()] = seen
+        end
+        local markerRadius = math.Clamp(28 * invScale, 0.8, 2.5)
+        local markerHeight = math.Clamp(80 * invScale, 2.5, 7)
+        local wpos = radar:Project(pos)
+        HoloEffects.DrawContactPing(radar.entityTable, wpos, color,
+            now - seen.time, markerRadius)
+        HoloEffects.DrawContactLabel(radar.entityTable, wpos, color,
+            markerHeight + 0.8, ply:Nick(), playerContactStatus(radar, ply, localPly))
+    end
+end
+
+function RADAR:Initialize()
+    self.Seen = {}
+end
+
 function RADAR:Draw()
+    if self:GetLOD() == 1 then
+        drawPlayerMarkers(self)
+        return
+    end
+
     local invScale = self:GetScale()
     beginPlayerLighting()
 
-    local ok, err = pcall(function()
-        for _, ply in player.Iterator() do
-            if not IsValid(ply) then continue end
-            if not ply:Alive() then continue end
-
-            if ply == LocalPlayer() then
-                drawProjectedLocalPlayer(self, ply, invScale)
-            else
-                drawProjectedPlayer(self, ply, invScale)
-            end
-        end
-    end)
+    local ok, err = pcall(drawPlayers, self, invScale)
 
     endPlayerLighting()
 
-    if not ok then
+    if ok then
+        self.DrawWarned = nil
+    elseif not self.DrawWarned then
+        self.DrawWarned = true
         ErrorNoHaltWithStack('[holo_table] player radar lighting draw aborted: ' .. tostring(err))
     end
 end
@@ -493,4 +608,5 @@ function RADAR:OnRemove()
     self.LocalPlayerMirror = nil
     removeMirror(self.LocalWeaponMirror)
     self.LocalWeaponMirror = nil
+    self.Seen = nil
 end
