@@ -7,6 +7,7 @@ if SERVER then
     util.AddNetworkString('holo_table_control')
     util.AddNetworkString('holo_table_setparams')
     util.AddNetworkString('holo_table_setlayers')
+    util.AddNetworkString('holo_table_setpower')
     util.AddNetworkString('holo_table_release')
 
     --- SIMPLE_USE fires once per E press; base_anim's default is
@@ -25,6 +26,13 @@ if SERVER then
     --- @param caller Entity
     function ENT:Use(activator, caller)
         if not (IsValid(activator) and activator:IsPlayer()) then return end
+
+        -- A direct physical switch that does not require entering control
+        -- mode. Normal E retains the existing interactive-control behavior.
+        if activator:KeyDown(IN_SPEED) then
+            self:SetTablePowered(not self:IsTablePowered())
+            return
+        end
 
         if self.Controller == activator then
             self:ReleaseController()
@@ -100,6 +108,15 @@ if SERVER then
         ent:SetEntities(entities)
     end)
 
+    net.Receive('holo_table_setpower', function(_, ply)
+        local ent = net.ReadEntity()
+        local powered = net.ReadBool()
+        if not IsValid(ent) or ent:GetClass() ~= 'holo_table_3d' then return end
+        if IsValid(ent.Controller) and ent.Controller ~= ply then return end
+        if not ent.SetTablePowered then return end
+        ent:SetTablePowered(powered)
+    end)
+
     net.Receive('holo_table_release', function(_, ply)
         local ent = net.ReadEntity()
         if not IsValid(ent) or ent:GetClass() ~= 'holo_table_3d' then return end
@@ -136,6 +153,11 @@ local dirty         = false
 local wasReloadDown = false
 local wasMapDown    = false
 local wasEntDown    = false
+local wasPowerDown  = false
+
+local function tablePowered(ent)
+    return not ent.GetPowered or ent:GetPowered()
+end
 
 
 local function clearLocalState()
@@ -145,6 +167,7 @@ local function clearLocalState()
     wasReloadDown = false
     wasMapDown    = false
     wasEntDown    = false
+    wasPowerDown  = false
 end
 
 net.Receive('holo_table_control', function()
@@ -176,6 +199,14 @@ local function sendLayers(ent)
     net.WriteEntity(ent)
     net.WriteBool(ent:GetMap())
     net.WriteBool(ent:GetEntities())
+    net.SendToServer()
+end
+
+local function sendPower(ent, powered)
+    if ent.SetPowered then ent:SetPowered(powered) end
+    net.Start('holo_table_setpower')
+    net.WriteEntity(ent)
+    net.WriteBool(powered)
     net.SendToServer()
 end
 
@@ -345,6 +376,12 @@ hook.Add('CreateMove', 'holo_table_3d.Controls', function(cmd)
     end
     wasMapDown = mapDown
 
+    local powerDown = input.IsKeyDown(KEY_H)
+    if powerDown and not wasPowerDown then
+        sendPower(ent, not tablePowered(ent))
+    end
+    wasPowerDown = powerDown
+
     if dirty and SysTime() >= nextSendTime then
         sendParams(ent)
         nextSendTime = SysTime() + SEND_INTERVAL
@@ -401,7 +438,8 @@ hook.Add('HUDPaint', 'holo_table_3d.Controls', function()
         bindKey('+speed', 'SHIFT'),
         bindKey('+reload', 'R'))
     local hint2 = string.format(
-        'T entities (%s)  -  G map (%s)  -  hold %s for precision  -  %s exit',
+        'H power (%s)  -  T entities (%s)  -  G map (%s)  -  %s precision  -  %s exit',
+        onOff(tablePowered(ent)),
         onOff(ent:GetEntities()),
         onOff(ent:GetMap()),
         bindKey('+duck', 'CTRL'),
@@ -455,4 +493,21 @@ concommand.Add('holo_table_focus_table', function()
     MsgC(Color(120, 200, 255),
         string.format('[holo_table] Table focus: scale=%d pan=(%.0f, %.0f) height=%.1f\n',
             ent:GetScale(), ent:GetPanX(), ent:GetPanY(), ent:GetHeight()))
+end)
+
+concommand.Add('holo_table_power', function(_, _, args)
+    local ent = findControlTarget()
+    if not IsValid(ent) then
+        MsgC(Color(255, 120, 120), '[holo_table] No holo_table_3d found.\n')
+        return
+    end
+
+    local value = args[1]
+    local powered
+    if value == nil then
+        powered = not tablePowered(ent)
+    else
+        powered = value ~= '0' and string.lower(value) ~= 'off'
+    end
+    sendPower(ent, powered)
 end)

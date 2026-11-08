@@ -12,6 +12,7 @@ local coroutine_status = coroutine.status
 local hook_Add = hook.Add
 local hook_Remove = hook.Remove
 local render_SetMaterial = render.SetMaterial
+local HoloEffects = ENT.HoloEffects
 local filter = MapCache.filter
 local staticPropBakeCvar = MapCache.staticPropBakeCvar
 local staticPropBakeModeCvar = MapCache.staticPropBakeModeCvar
@@ -19,27 +20,40 @@ local PROP_SUBPIXEL_THRESHOLD = MapCache.PROP_SUBPIXEL_THRESHOLD
 local CACHE_GENERATION = MapCache.CACHE_GENERATION
 local getPropBounds = MapCache.getPropBounds
 local getPropDrawEnt = MapCache.getPropDrawEnt
-local buildMeshFromTriangles = MapCache.buildMeshFromTriangles
+local peekPropBounds = MapCache.peekPropBounds
+local peekPropDrawEnt = MapCache.peekPropDrawEnt
+local buildMeshFromFlatTriangles = MapCache.buildMeshFromFlatTriangles
+local FLAT_VERTEX_STRIDE = MapCache.FLAT_VERTEX_STRIDE
 local PROP_DRAW_SCRATCH_POS = MapCache.PROP_DRAW_SCRATCH_POS
 local PROP_DRAW_SCRATCH_ANG = MapCache.PROP_DRAW_SCRATCH_ANG
 local atan2 = math_atan2
 local sqrt = math_sqrt
 local RAD2DEG = 180 / math_pi
-local STATIC_PROP_BAKE_HOOK = 'holo_table_3d.static_prop_bake'
 local STATIC_PROP_PER_PROP_BAKE_HOOK = 'holo_table_3d.static_prop_per_prop_bake'
 local STATIC_PROP_BAKE_FRAME_BUDGET = 0.006
-local STATIC_PROP_BAKE_MAX_VERTS = 12000
+-- Verts per baked IMesh. IMeshes take up to 65532 verts (16-bit indices);
+-- 30000 keeps a single unyieldable mesh.Begin under ~15 ms while cutting
+-- draw calls, which bound the steady-state cost on dense maps.
+local STATIC_PROP_BAKE_MAX_VERTS = 30000
 local STATIC_PROP_BAKE_PER_VERT_SEC = 0.5e-6
-MapCache.staticPropBake = nil
-MapCache.staticPropPerPropBake = nil
-
-function MapCache.destroyStaticPropBake()
-    hook_Remove('Think', STATIC_PROP_BAKE_HOOK)
-    if MapCache.staticPropBake and MapCache.staticPropBake.meshes then
-        MapCache.destroyMeshList(MapCache.staticPropBake.meshes)
-    end
-    MapCache.staticPropBake = nil
+-- Per-frame budget for cache-missing model loads in the legacy draw path.
+local LEGACY_PROP_LOAD_FRAME_BUDGET = 0.003
+--- Model LOD used for prop bakes at a given table scale. At scale 36 a
+--- 100-unit prop is ~3 holo units across, so LOD0 is wasted geometry: on
+--- gm_gmall_2 the LOD0 static bake heads for ~15M+ vertices. GetModelMeshes
+--- clamps an out-of-range LOD to the model's lowest, so 8 means "lowest".
+--- Bakes are rebuilt when the table zooms in past the scale they were
+--- built for, so a closer view picks up the finer LOD.
+--- @param scale number
+--- @return number lod
+local function propBakeLodForScale(scale)
+    if scale >= 12 then return 8 end
+    if scale >= 4 then return 2 end
+    if scale >= 2 then return 1 end
+    return 0
 end
+MapCache.propBakeLodForScale = propBakeLodForScale
+MapCache.staticPropPerPropBake = nil
 
 function MapCache.destroyStaticPropPerPropBake()
     hook_Remove('Think', STATIC_PROP_PER_PROP_BAKE_HOOK)
@@ -72,8 +86,9 @@ local function staticPropBakeMaterial(path)
     return mat, btn and btn:GetName() or mat:GetName()
 end
 
---- Transforms a model-local vert into BSP space and appends to out.
---- @param out table Vertex list to append to.
+--- Transforms a model-local vert into BSP space and appends packed
+--- px,py,pz,nx,ny,nz,u,v values to out.
+--- @param out number[] Vertex buffer to append to.
 --- @param vert table { pos: Vector, normal?: Vector, u: number, v: number }
 --- @param origin Vector World origin of the prop.
 --- @param fx number @param fy number @param fz number Forward basis.
@@ -84,184 +99,71 @@ local function addStaticPropBakeVert(out, vert, origin, fx, fy, fz, rx, ry, rz, 
     local px, py, pz = pos.x, pos.y, pos.z
     local normal = vert.normal or vector_up
     local nx, ny, nz = normal.x, normal.y, normal.z
-    local outNormal = Vector(
-        fx * nx - rx * ny + ux * nz,
-        fy * nx - ry * ny + uy * nz,
-        fz * nx - rz * ny + uz * nz)
-    outNormal:Normalize()
-
-    out[#out + 1] = {
-        pos = Vector(
-            origin.x + fx * px - rx * py + ux * pz,
-            origin.y + fy * px - ry * py + uy * pz,
-            origin.z + fz * px - rz * py + uz * pz),
-        normal = outNormal,
-        u = vert.u,
-        v = vert.v,
-    }
+    local outNX = fx * nx - rx * ny + ux * nz
+    local outNY = fy * nx - ry * ny + uy * nz
+    local outNZ = fz * nx - rz * ny + uz * nz
+    local normalLength = math_sqrt(outNX * outNX + outNY * outNY + outNZ * outNZ)
+    if normalLength > 0 then
+        local invLength = 1 / normalLength
+        outNX, outNY, outNZ = outNX * invLength, outNY * invLength, outNZ * invLength
+    end
+    local i = #out
+    out[i + 1] = origin.x + fx * px - rx * py + ux * pz
+    out[i + 2] = origin.y + fy * px - ry * py + uy * pz
+    out[i + 3] = origin.z + fz * px - rz * py + uz * pz
+    out[i + 4] = outNX
+    out[i + 5] = outNY
+    out[i + 6] = outNZ
+    out[i + 7] = vert.u or 0
+    out[i + 8] = vert.v or 0
 end
 MapCache.addStaticPropBakeVert = addStaticPropBakeVert
 
---- Kicks an async coroutine that bakes every BSP static prop into a global,
---- material-batched IMesh list at the given scale.
---- @param scale number Holo table scale this bake is built for.
-function MapCache.startStaticPropBake(scale)
-    if not staticPropBakeCvar:GetBool() then return end
-    local bsp = bsp2 and bsp2.GetCurrent()
-    if not bsp or not bsp.props or #bsp.props == 0 then return end
-    scale = tonumber(scale) or 0
-    if scale <= 0 then return end
-    if MapCache.staticPropBake and MapCache.staticPropBake.gen == CACHE_GENERATION
-        and math.abs((MapCache.staticPropBake.scale or 0) - scale) < 0.01
-        and (MapCache.staticPropBake.state == 'building' or MapCache.staticPropBake.state == 'ready') then
-        return
+local propOrderCache = setmetatable({}, { __mode = 'k' })
+
+--- Returns prop indices sorted by model|skin so a bake can fetch each
+--- model's mesh data once and drop it after its last instance, instead of
+--- holding util.GetModelMeshes output for every unique model at once.
+--- Cached per props table (weak keys).
+--- @param props table[] Records with .model and optional .skin.
+--- @return number[] order
+--- @return table<number, string> keys index -> model|skin
+local function propOrderByModel(props)
+    local cached = propOrderCache[props]
+    if cached then return cached.order, cached.keys end
+    local order, keys = {}, {}
+    for i = 1, #props do
+        local p = props[i]
+        if p and p.model then
+            order[#order + 1] = i
+            keys[i] = p.model .. '|' .. (p.skin or 0)
+        end
     end
-
-    MapCache.destroyStaticPropBake()
-    local minRadius = PROP_SUBPIXEL_THRESHOLD / (2 / scale)
-    MapCache.staticPropBake = {
-        gen = CACHE_GENERATION,
-        state = 'building',
-        scale = scale,
-        minRadius = minRadius,
-        meshes = {},
-        props = #bsp.props,
-        bakedProps = 0,
-        outputVerts = 0,
-    }
-
-    MapCache.staticPropBake.co = coroutine_create(function()
-        local props = bsp.props
-        local modelCache = {}
-        local groups = {}
-        local deadline = SysTime() + STATIC_PROP_BAKE_FRAME_BUDGET
-
-        local function bumpDeadline()
-            deadline = SysTime() + STATIC_PROP_BAKE_FRAME_BUDGET
-        end
-
-        local function budgetYield()
-            if SysTime() <= deadline then return end
-            coroutine_yield()
-            bumpDeadline()
-        end
-
-        local function flushGroup(group)
-            local verts = group.verts
-            local n = #verts
-            if n == 0 then return end
-            if SysTime() + n * STATIC_PROP_BAKE_PER_VERT_SEC > deadline then
-                coroutine_yield()
-                bumpDeadline()
-            end
-            local msh = buildMeshFromTriangles(verts)
-            MapCache.staticPropBake.meshes[#MapCache.staticPropBake.meshes + 1] = { mat = group.mat, mesh = msh }
-            MapCache.staticPropBake.outputVerts = MapCache.staticPropBake.outputVerts + n
-            group.verts = {}
-            budgetYield()
-        end
-
-        local function groupFor(mat, matKey)
-            local group = groups[matKey]
-            if not group then
-                group = { mat = mat, verts = {} }
-                groups[matKey] = group
-            end
-            return group
-        end
-
-        for i = 1, #props do
-            budgetYield()
-            local prop = props[i]
-            local model = prop and prop.model
-            if not model then continue end
-
-            local bounds = getPropBounds(model)
-            if bounds.radius == 0 or bounds.radius < minRadius then continue end
-
-            local skin = prop.skin or 0
-            local modelKey = model .. '|skin=' .. tostring(skin)
-            local modelMeshes = modelCache[modelKey]
-            if modelMeshes == nil then
-                modelMeshes = util.GetModelMeshes(model, 0, 0, skin) or false
-                modelCache[modelKey] = modelMeshes
-            end
-            if not modelMeshes then continue end
-
-            local origin = prop.origin
-            if not origin then continue end
-            MapCache.staticPropBake.bakedProps = MapCache.staticPropBake.bakedProps + 1
-
-            local fx, fy, fz, rx, ry, rz, ux, uy, uz
-            if prop.angles then
-                local f = prop.angles:Forward()
-                local r = prop.angles:Right()
-                local u = prop.angles:Up()
-                fx, fy, fz = f.x, f.y, f.z
-                rx, ry, rz = r.x, r.y, r.z
-                ux, uy, uz = u.x, u.y, u.z
-            else
-                fx, fy, fz = 1, 0, 0
-                rx, ry, rz = 0, -1, 0
-                ux, uy, uz = 0, 0, 1
-            end
-
-            for _, meshData in ipairs(modelMeshes) do
-                local mat, matKey = staticPropBakeMaterial(meshData.material)
-                local tris = meshData.triangles
-                if not (mat and tris) then continue end
-
-                local group = groupFor(mat, matKey)
-                local out = group.verts
-                for vi = 1, #tris do
-                    addStaticPropBakeVert(out, tris[vi], origin, fx, fy, fz, rx, ry, rz, ux, uy, uz)
-                    if #out >= STATIC_PROP_BAKE_MAX_VERTS then
-                        flushGroup(group)
-                        out = group.verts
-                    elseif vi % 768 == 0 then
-                        budgetYield()
-                    end
-                end
-            end
-        end
-
-        for _, group in pairs(groups) do
-            flushGroup(group)
-        end
-
-        MapCache.staticPropBake.state = 'ready'
+    table.sort(order, function(a, b)
+        local ka, kb = keys[a], keys[b]
+        if ka ~= kb then return ka < kb end
+        return a < b
     end)
+    propOrderCache[props] = { order = order, keys = keys }
+    return order, keys
+end
+MapCache.propOrderByModel = propOrderByModel
 
-    hook_Add('Think', STATIC_PROP_BAKE_HOOK, function()
-        if not MapCache.staticPropBake or MapCache.staticPropBake.gen ~= CACHE_GENERATION then
-            MapCache.destroyStaticPropBake()
-            return
-        end
-        if MapCache.staticPropBake.state ~= 'building' then
-            hook_Remove('Think', STATIC_PROP_BAKE_HOOK)
-            return
-        end
-        if MapCache.anyClipCoroutineActive() then return end
-
-        local ok, err = coroutine_resume(MapCache.staticPropBake.co)
-        if not ok then
-            ErrorNoHaltWithStack(err)
-            MapCache.destroyStaticPropBake()
-            return
-        end
-        if coroutine_status(MapCache.staticPropBake.co) == 'dead' then
-            MapCache.staticPropBake.co = nil
-            if MapCache.staticPropBake.state == 'building' then MapCache.staticPropBake.state = 'ready' end
-            hook_Remove('Think', STATIC_PROP_BAKE_HOOK)
-            MsgC(Color(120, 200, 255), string.format(
-                '[holo_table] Static prop bake ready: props=%d/%d scale=%.1f meshes=%d verts=%d\n',
-                MapCache.staticPropBake.bakedProps or 0,
-                MapCache.staticPropBake.props or 0,
-                MapCache.staticPropBake.scale or 0,
-                MapCache.staticPropBake.meshes and #MapCache.staticPropBake.meshes or 0,
-                MapCache.staticPropBake.outputVerts or 0))
-        end
-    end)
+--- True when the global static-prop bake applies to this view: always in
+--- mode 3, only for horizontally all-in views in mode 1.
+---
+--- Dense maps must NOT be routed to the legacy renderer for partial views:
+--- it synchronously loads every in-view model (util.GetModelInfo +
+--- ClientsideModel) and issues one SetupBones/DrawModel per prop per frame,
+--- which froze gm_mall2 for minutes on spawn.
+--- @param ent Entity
+--- @param scale number
+--- @return boolean
+function MapCache.canUseGlobalStaticPropBake(ent, scale)
+    local mode = staticPropBakeModeCvar:GetInt()
+    if mode == 3 then return true end
+    if mode ~= 1 then return false end
+    return ent:CylinderHorizContainsMap(scale, ent:GetPanX(), ent:GetPanY())
 end
 
 --- Per-prop variant of startStaticPropBake. Each prop becomes its own
@@ -276,7 +178,7 @@ function MapCache.startStaticPropPerPropBake(scale)
     scale = tonumber(scale) or 0
     if scale <= 0 then return end
     if MapCache.staticPropPerPropBake and MapCache.staticPropPerPropBake.gen == CACHE_GENERATION
-        and math.abs((MapCache.staticPropPerPropBake.scale or 0) - scale) < 0.01
+        and (MapCache.staticPropPerPropBake.scale or math.huge) <= scale + 0.01
         and (MapCache.staticPropPerPropBake.state == 'building' or MapCache.staticPropPerPropBake.state == 'ready') then
         return
     end
@@ -298,7 +200,6 @@ function MapCache.startStaticPropPerPropBake(scale)
 
     MapCache.staticPropPerPropBake.co = coroutine_create(function()
         local props = bsp.props
-        local modelCache = {}
         local deadline = SysTime() + STATIC_PROP_BAKE_FRAME_BUDGET
 
         local function bumpDeadline()
@@ -313,17 +214,18 @@ function MapCache.startStaticPropPerPropBake(scale)
 
         local function flushGroup(group, meshes)
             local verts = group.verts
-            local n = #verts
-            if n == 0 then return end
-            if SysTime() + n * STATIC_PROP_BAKE_PER_VERT_SEC > deadline then
+            local valueCount = #verts
+            if valueCount == 0 then return end
+            local vertCount = valueCount / FLAT_VERTEX_STRIDE
+            if SysTime() + vertCount * STATIC_PROP_BAKE_PER_VERT_SEC > deadline then
                 coroutine_yield()
                 bumpDeadline()
             end
-            local msh = buildMeshFromTriangles(verts)
+            local msh = buildMeshFromFlatTriangles(verts)
             local item = { mat = group.mat, mesh = msh }
             meshes[#meshes + 1] = item
             MapCache.staticPropPerPropBake.pendingMeshes[#MapCache.staticPropPerPropBake.pendingMeshes + 1] = item
-            MapCache.staticPropPerPropBake.outputVerts = MapCache.staticPropPerPropBake.outputVerts + n
+            MapCache.staticPropPerPropBake.outputVerts = MapCache.staticPropPerPropBake.outputVerts + vertCount
             group.verts = {}
             budgetYield()
         end
@@ -337,22 +239,25 @@ function MapCache.startStaticPropPerPropBake(scale)
             return group
         end
 
-        for i = 1, #props do
+        local order, keys = propOrderByModel(props)
+        local currentModelKey, modelMeshes = nil, false
+        local bakeLod = propBakeLodForScale(scale)
+        for oi = 1, #order do
             budgetYield()
+            local i = order[oi]
             local prop = props[i]
-            local model = prop and prop.model
-            if not model then continue end
+            local model = prop.model
 
             local bounds = getPropBounds(model)
             local radius = bounds.radius
             if radius == 0 or radius < minRadius then continue end
 
-            local skin = prop.skin or 0
-            local modelKey = model .. '|skin=' .. tostring(skin)
-            local modelMeshes = modelCache[modelKey]
-            if modelMeshes == nil then
-                modelMeshes = util.GetModelMeshes(model, 0, 0, skin) or false
-                modelCache[modelKey] = modelMeshes
+            local modelKey = keys[i]
+            if modelKey ~= currentModelKey then
+                currentModelKey = modelKey
+                modelMeshes = false
+                budgetYield()
+                modelMeshes = util.GetModelMeshes(model, bakeLod, 0, prop.skin or 0) or false
             end
             if not modelMeshes then continue end
 
@@ -390,7 +295,7 @@ function MapCache.startStaticPropPerPropBake(scale)
                 local out = group.verts
                 for vi = 1, #tris do
                     addStaticPropBakeVert(out, tris[vi], origin, fx, fy, fz, rx, ry, rz, ux, uy, uz)
-                    if #out >= STATIC_PROP_BAKE_MAX_VERTS then
+                    if #out >= STATIC_PROP_BAKE_MAX_VERTS * FLAT_VERTEX_STRIDE then
                         flushGroup(group, meshes)
                         out = group.verts
                     elseif vi % 768 == 0 then
@@ -427,6 +332,7 @@ function MapCache.startStaticPropPerPropBake(scale)
             return
         end
         if MapCache.anyClipCoroutineActive() then return end
+        if not MapCache.claimBackgroundSlot('static_per_prop_bake') then return end
 
         local ok, err = coroutine_resume(MapCache.staticPropPerPropBake.co)
         if not ok then
@@ -451,11 +357,62 @@ function MapCache.startStaticPropPerPropBake(scale)
     end)
 end
 
+local function drawStaticBakeMeshes(meshes)
+    local lastMat
+    for i = 1, #meshes do
+        local item = meshes[i]
+        if item.mesh then
+            local mat = item.mat
+            if mat ~= lastMat then
+                render_SetMaterial(mat)
+                lastMat = mat
+            end
+            item.mesh:Draw()
+        end
+    end
+end
 
---- Draws the active baked static-prop bake for the given holo table.
---- Returns false on cache miss / scale mismatch / disabled bake; the caller
---- then falls back to ENT:DrawStaticProps.
---- @return boolean drewBake
+local function drawCulledStaticBake(props, axisX, axisY, axisZ,
+    panX, panY, panZ, cylRadius, floorOffset)
+    for i = 1, #props do
+        local rec = props[i]
+        local cx, cy, cz = rec.cx, rec.cy, rec.cz
+        local radius = rec.radius
+        local along = cx * axisX + cy * axisY + cz * axisZ
+        local hx = cx - axisX * along - panX
+        local hy = cy - axisY * along - panY
+        local hz = cz - axisZ * along - panZ
+        local bound = cylRadius + radius
+        if hx * hx + hy * hy + hz * hz > bound * bound then continue end
+        if along + radius < floorOffset then continue end
+        drawStaticBakeMeshes(rec.meshes)
+    end
+end
+
+local function drawEffectCulledStaticBake(props, axisX, axisY, axisZ,
+    panX, panY, panZ, cylRadius, floorOffset)
+    for i = 1, #props do
+        local rec = props[i]
+        local cx, cy, cz = rec.cx, rec.cy, rec.cz
+        local radius = rec.radius
+        local along = cx * axisX + cy * axisY + cz * axisZ
+        local hx = cx - axisX * along - panX
+        local hy = cy - axisY * along - panY
+        local hz = cz - axisZ * along - panZ
+        local bound = cylRadius + radius
+        if hx * hx + hy * hy + hz * hz > bound * bound then continue end
+        if along + radius < floorOffset then continue end
+        HoloEffects.DrawMeshList(rec.meshes)
+    end
+end
+
+
+--- Draws baked static props for the given holo table: tiered, lazily baked
+--- cells in modes 1/3 (see cl_map_prop_cells.lua), per-prop bake in mode 2.
+--- Returns true whenever the baked path owns the layer, including while
+--- cells are still baking. Returns false only when the bake is disabled /
+--- not applicable, and the caller falls back to ENT:DrawStaticProps.
+--- @return boolean handled
 --- @see ENT:DrawStaticProps
 function ENT:DrawBakedStaticProps()
     if not staticPropBakeCvar:GetBool() then return false end
@@ -465,42 +422,29 @@ function ENT:DrawBakedStaticProps()
     if mode == 0 then return false end
     local scale = self:GetScale()
     if mode == 2 then
-        if not MapCache.staticPropPerPropBake or MapCache.staticPropPerPropBake.gen ~= CACHE_GENERATION then
+        if not MapCache.staticPropPerPropBake or MapCache.staticPropPerPropBake.gen ~= CACHE_GENERATION
+            or (MapCache.staticPropPerPropBake.scale or math.huge) > scale + 0.01 then
             MapCache.startStaticPropPerPropBake(scale)
-            return false
+            return MapCache.staticPropPerPropBake ~= nil
         end
-        if math.abs((MapCache.staticPropPerPropBake.scale or 0) - scale) >= 0.01 then
-            MapCache.startStaticPropPerPropBake(scale)
-            return false
-        end
-        if MapCache.staticPropPerPropBake.state ~= 'ready' or not MapCache.staticPropPerPropBake.props then return false end
+        if MapCache.staticPropPerPropBake.state ~= 'ready' or not MapCache.staticPropPerPropBake.props then return true end
 
         local axisX, axisY, axisZ = selfTbl._holoAxis:Unpack()
         local panX,  panY,  panZ  = selfTbl._holoPanHoriz:Unpack()
         local cylRadius           = selfTbl._holoCylRadius
         local floorOffset         = selfTbl._holoFloorOffset
 
-        render.SuppressEngineLighting(true)
-        local ok, err = pcall(function()
-            for _, rec in ipairs(MapCache.staticPropPerPropBake.props) do
-                local cx, cy, cz = rec.cx, rec.cy, rec.cz
-                local radius = rec.radius
-                local along = cx * axisX + cy * axisY + cz * axisZ
-                local hx = cx - axisX * along - panX
-                local hy = cy - axisY * along - panY
-                local hz = cz - axisZ * along - panZ
-                local bound = cylRadius + radius
-                if hx * hx + hy * hy + hz * hz > bound * bound then continue end
-                if along + radius < floorOffset then continue end
+        if HoloEffects.ArePropsEnabled() and HoloEffects.BeginDraw(selfTbl, true) then
+            local effectOk, effectErr = pcall(drawEffectCulledStaticBake,
+                MapCache.staticPropPerPropBake.props,
+                axisX, axisY, axisZ, panX, panY, panZ, cylRadius, floorOffset)
+            if HoloEffects.EndDraw(effectOk, effectErr) then return true end
+        end
 
-                for _, item in ipairs(rec.meshes) do
-                    if item.mesh then
-                        render_SetMaterial(item.mat)
-                        item.mesh:Draw()
-                    end
-                end
-            end
-        end)
+        render.SuppressEngineLighting(true)
+        local ok, err = pcall(drawCulledStaticBake,
+            MapCache.staticPropPerPropBake.props,
+            axisX, axisY, axisZ, panX, panY, panZ, cylRadius, floorOffset)
         render.SuppressEngineLighting(false)
 
         if not ok then
@@ -511,37 +455,8 @@ function ENT:DrawBakedStaticProps()
         return true
     end
 
-    if mode ~= 3 and not self:CylinderHorizContainsMap(scale, self:GetPanX(), self:GetPanY()) then
-        return false
-    end
-    if not MapCache.staticPropBake or MapCache.staticPropBake.gen ~= CACHE_GENERATION then
-        MapCache.startStaticPropBake(scale)
-        return false
-    end
-    if math.abs((MapCache.staticPropBake.scale or 0) - scale) >= 0.01 then
-        MapCache.startStaticPropBake(scale)
-        return false
-    end
-    if MapCache.staticPropBake.state ~= 'ready' or not MapCache.staticPropBake.meshes then return false end
-
-    render.SuppressEngineLighting(true)
-    local ok, err = pcall(function()
-        for _, item in ipairs(MapCache.staticPropBake.meshes) do
-            if item.mesh then
-                render_SetMaterial(item.mat)
-                item.mesh:Draw()
-            end
-        end
-    end)
-    render.SuppressEngineLighting(false)
-
-    if not ok then
-        ErrorNoHaltWithStack('[holo_table] DrawBakedStaticProps aborted: ' .. tostring(err))
-        MapCache.destroyStaticPropBake()
-        return false
-    end
-
-    return true
+    if not MapCache.canUseGlobalStaticPropBake(self, scale) then return false end
+    return MapCache.drawPropCells(selfTbl, scale)
 end
 
 --- Legacy fallback: per-prop ClientsideModel draws in world space, sphere-
@@ -579,13 +494,21 @@ function ENT:DrawStaticProps()
     local tUx, tUy, tUz = tU.x, tU.y, tU.z
     local toX, toY, toZ = tableOrigin.x, tableOrigin.y, tableOrigin.z
 
+    -- util.GetModelInfo / ClientsideModel are synchronous model loads;
+    -- spread first-time loads over frames instead of all in the first one.
+    local loadDeadline = SysTime() + LEGACY_PROP_LOAD_FRAME_BUDGET
+
     render.SuppressEngineLighting(true)
     for i = 1, #props do
         local prop = props[i]
         local model = prop.model
         if not model then continue end
 
-        local b = getPropBounds(model)
+        local b = peekPropBounds(model)
+        if not b then
+            if SysTime() > loadDeadline then continue end
+            b = getPropBounds(model)
+        end
         local radius = b.radius
         if radius == 0 then continue end
         if radius < subpxRadiusBSP then continue end
@@ -630,8 +553,12 @@ function ENT:DrawStaticProps()
         if hx * hx + hy * hy + hz * hz > bound * bound then continue end
         if along + radius < floorOffset then continue end
 
-        local cs = getPropDrawEnt(model)
-        if not IsValid(cs) then continue end
+        local cs = peekPropDrawEnt(model)
+        if not cs then
+            if SysTime() > loadDeadline then continue end
+            cs = getPropDrawEnt(model)
+            if not IsValid(cs) then continue end
+        end
 
         local origin = prop.origin
         local lx = origin.x * invScale
@@ -662,7 +589,9 @@ function ENT:DrawStaticProps()
         end
         cs:SetModelScale(invScale, 0)
         cs:SetupBones()
-        cs:DrawModel()
+        if not HoloEffects.DrawPropModel(selfTbl, cs, i * 0.17) then
+            cs:DrawModel()
+        end
     end
     render.SuppressEngineLighting(false)
 end

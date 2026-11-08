@@ -58,3 +58,63 @@ function MapCache.buildMeshFromTriangles(verts)
 
     return msh
 end
+
+local FLAT_VERTEX_STRIDE = 8
+local FLAT_MESH_POS = Vector()
+local FLAT_MESH_NORMAL = Vector()
+
+--- Builds an IMesh from packed px,py,pz,nx,ny,nz,u,v values. Prop bakes
+--- use this to avoid allocating a table plus two Vectors for every vertex.
+--- @param verts number[]
+--- @return IMesh? mesh
+function MapCache.buildMeshFromFlatTriangles(verts)
+    local vertCount = math.floor(#verts / FLAT_VERTEX_STRIDE)
+    vertCount = vertCount - (vertCount % 3)
+    if vertCount < 3 then return nil end
+
+    local msh = Mesh()
+    mesh.Begin(msh, MATERIAL_TRIANGLES, vertCount / 3)
+    local offset = 1
+    for _ = 1, vertCount do
+        FLAT_MESH_POS:SetUnpacked(verts[offset], verts[offset + 1], verts[offset + 2])
+        FLAT_MESH_NORMAL:SetUnpacked(verts[offset + 3], verts[offset + 4], verts[offset + 5])
+        mesh.Position(FLAT_MESH_POS)
+        mesh.Normal(FLAT_MESH_NORMAL)
+        mesh.TexCoord(0, verts[offset + 6] or 0, verts[offset + 7] or 0)
+        mesh.AdvanceVertex()
+        offset = offset + FLAT_VERTEX_STRIDE
+    end
+    mesh.End()
+
+    return msh
+end
+
+MapCache.FLAT_VERTEX_STRIDE = FLAT_VERTEX_STRIDE
+
+--- Reorders a {mat, mesh} list in place so items sharing a material are
+--- adjacent (stable, first-appearance order). Draw loops then skip the
+--- redundant render.SetMaterial calls; bakes append a group's meshes at
+--- different times, so the raw order interleaves materials.
+--- @param list table[]
+function MapCache.sortMeshListByMaterial(list)
+    if not list or #list < 2 then return end
+    local buckets, order = {}, {}
+    for i = 1, #list do
+        local item = list[i]
+        local bucket = buckets[item.mat]
+        if not bucket then
+            bucket = {}
+            buckets[item.mat] = bucket
+            order[#order + 1] = bucket
+        end
+        bucket[#bucket + 1] = item
+    end
+    local n = 0
+    for b = 1, #order do
+        local bucket = order[b]
+        for j = 1, #bucket do
+            n = n + 1
+            list[n] = bucket[j]
+        end
+    end
+end

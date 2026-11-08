@@ -1,6 +1,9 @@
 -- Radar subsystem: module loader + ENT lifecycle hooks. Drop a file in
 -- entities/holo_table_3d/radar/ defining RADAR:Initialize/Think/Draw/OnRemove.
 
+local EntityDefinition = ENT
+local HoloEffects = EntityDefinition.HoloEffects
+
 --- @class RadarBase
 --- @field entity Entity Owning holo_table_3d.
 --- @field entityTable table Cached self:GetTable() of the owning entity.
@@ -8,6 +11,9 @@
 --- self = inst -> mod -> RadarBase, so module bodies have these accessors.
 local RadarBase = {}
 RadarBase.__index = RadarBase
+RadarBase.HoloEffects = EntityDefinition.HoloEffects
+local radarLodCvar = CreateClientConVar('holo_table_radar_lod', '0', true, false,
+    'Radar detail: 0 full models, 1 low-detail markers, 2 disabled.')
 
 --- @return Entity table The owning holo_table_3d entity.
 function RadarBase:GetEntity() return self.entity end
@@ -20,6 +26,29 @@ function RadarBase:GetOrigin() return self.entityTable._holoOrigin end
 
 --- @return Angle world Hologram angles in world space (current frame).
 function RadarBase:GetAngles() return self.entityTable._holoAngles end
+
+--- @return number lod 0 full models, 1 markers, 2 disabled.
+function RadarBase:GetLOD() return math.Clamp(radarLodCvar:GetInt(), 0, 2) end
+
+--- Conservative BSP-space sphere test against the current holo cylinder.
+--- Avoids model animation/draw work that the stencil would discard anyway.
+--- @param pos Vector BSP-space center.
+--- @param radius number? BSP-space bounding radius.
+--- @return boolean visible
+function RadarBase:IsVisible(pos, radius)
+    local e = self.entityTable
+    radius = radius or 0
+    local px, py, pz = pos.x, pos.y, pos.z
+    local axisX, axisY, axisZ = e._holoAxis:Unpack()
+    local panX, panY, panZ = e._holoPanHoriz:Unpack()
+    local along = px * axisX + py * axisY + pz * axisZ
+    local hx = px - axisX * along - panX
+    local hy = py - axisY * along - panY
+    local hz = pz - axisZ * along - panZ
+    local bound = e._holoCylRadius + radius
+    return hx * hx + hy * hy + hz * hz <= bound * bound
+        and along + radius >= e._holoFloorOffset
+end
 
 local atan2, sqrt = math.atan2, math.sqrt
 local cos, sin    = math.cos, math.sin
@@ -75,16 +104,21 @@ end
 
 local registry = {}
 
---- Walks radar/*.lua, sets _G.RADAR to a fresh per-module table chained to
---- RadarBase, includes the file, and pushes the populated module onto the registry.
+--- Walks radar/*.lua, temporarily sets _G.RADAR to a fresh per-module table
+--- chained to RadarBase, includes the file, and pushes the populated module
+--- onto the registry. Whatever _G.RADAR held before is restored afterwards:
+--- other addons and maps use that global too (gm_gmall_2 defines
+--- `RADAR = {}` and calls RADAR:Draw() every frame), so clearing it to nil
+--- broke them.
 local function loadModules()
     registry = {}
+    local previousRadar = rawget(_G, 'RADAR')
     for _, fname in ipairs(file.Find('entities/holo_table_3d/radar/*.lua', 'LUA')) do
         local mod = setmetatable({}, RadarBase)
         mod.__index = mod
         _G.RADAR = mod
         local ok, err = pcall(include, 'entities/holo_table_3d/radar/' .. fname)
-        _G.RADAR = nil
+        _G.RADAR = previousRadar
         if not ok then
             MsgC(Color(255, 120, 120),
                 '[holo_table] radar module ' .. fname .. ' failed to load: ' .. tostring(err) .. '\n')
@@ -122,12 +156,36 @@ end
 --- Iterates every module's Draw. Runs outside the m2 matrix block in
 --- DrawHologram because Entity:DrawModel ignores cam matrices.
 --- @see ENT:DrawHologram
---- @see RadarBase.Project
+--- @see RadarBase:Project
+local drawFailureWarned = {}
+local function drawRadar(inst)
+    inst:Draw()
+end
+
 function ENT:DrawRadar()
-    local radars = self:GetTable().Radars
+    if radarLodCvar:GetInt() >= 2 then return end
+    local selfTbl = self:GetTable()
+    if HoloEffects.IsPoweredOff(selfTbl) then return end
+    local radars = selfTbl.Radars
     if not radars then return end
-    for _, inst in pairs(radars) do
-        if isfunction(inst.Draw) then inst:Draw() end
+    for name, inst in pairs(radars) do
+        if not isfunction(inst.Draw) then continue end
+
+        local ok, err = pcall(drawRadar, inst)
+        if ok then continue end
+
+        -- Keep one broken/just-reloaded module from aborting DrawHologram and
+        -- leaking its outer clip planes and texture filters into the frame.
+        render.MaterialOverride(nil)
+        render.MaterialOverrideByIndex()
+        render.SetBlend(1)
+        render.SetColorModulation(1, 1, 1)
+        render.SuppressEngineLighting(false)
+
+        if drawFailureWarned[name] then continue end
+        drawFailureWarned[name] = true
+        ErrorNoHalt(string.format('[holo_table] Radar %s draw failed: %s\n',
+            tostring(name), tostring(err)))
     end
 end
 
@@ -140,6 +198,7 @@ function ENT:CleanupRadar()
     selfTbl.Radars = nil
 end
 
+concommand.Remove('holo_table_radar_reload')
 concommand.Add('holo_table_radar_reload', function()
     loadModules()
 
@@ -148,8 +207,10 @@ concommand.Add('holo_table_radar_reload', function()
         if ent:GetClass() ~= 'holo_table_3d' then continue end
         if not (ent.CleanupRadar and ent.InitializeRadar) then continue end
 
-        ent:CleanupRadar()
-        ent:InitializeRadar()
+        -- Existing entity userdata can retain its old method table through a
+        -- manual include; call this file's fresh closures explicitly.
+        EntityDefinition.CleanupRadar(ent)
+        EntityDefinition.InitializeRadar(ent)
         count = count + 1
     end
 

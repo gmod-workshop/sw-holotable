@@ -25,22 +25,16 @@ entities, static props, radar markers, and players are GPU-clipped via a
   material per texinfo for lightmap-free holo rendering.
 - `lua/entities/holo_table_3d/shared.lua` — `ENT.Type/Base`, metadata,
   `SetupDataTables` (NetworkVars: `Entities` Bool0, `Map` Bool1,
-  `Height` Float0, `Scale` Float1, `PanX` Float2, `PanY` Float3).
-- `lua/entities/holo_table_3d/init.lua` — server `Initialize` (sets
-  `SIMPLE_USE`), `ENT:Use`/`ReleaseController`/`OnRemove` ownership
-  handling, `PlayerDisconnected` cleanup, net receivers for
-  `holo_table_autocenter` / `holo_table_focus_table` /
-  `holo_table_setparams` / `holo_table_setlayers` /
-  `holo_table_release`, and `AddCSLuaFile` for
-  every client component including loops over `map/*.lua` and
-  `radar/*.lua`.
-  `setparams` / `setlayers` / `release` are ownership-gated;
-  `setparams`, `autocenter`, and `focus_table` are clamped to the
-  NetworkVar limits. `autocenter` / `focus_table` are blocked when the
-  table is controlled by someone else, while remaining usable on
-  unowned tables.
-- `lua/entities/holo_table_3d/cl_init.lua` — slim coordinator (~410
-  lines). `ENT:Initialize`/`Think`/`OnRemove` delegate to the
+  `Powered` Bool2, `Height` Float0, `Scale` Float1, `PanX` Float2,
+  `PanY` Float3, `ProjectorRadius` Float4, `Team` Int0), and the shared
+  map-fit calculation.
+- `lua/entities/holo_table_3d/init.lua` — server spawn/model/physics setup,
+  control lifecycle delegation, default view params, and `AddCSLuaFile` for
+  every client component including loops over `effects/*.lua`, `map/*.lua`,
+  and `radar/*.lua`.
+- `lua/entities/holo_table_3d/cl_init.lua` — coordinator (~530 lines,
+  including the benchmark harness). `ENT:Initialize`/`Think`/`OnRemove`
+  delegate to the
   per-subsystem hooks (`InitializeMap` / `InitializeRadar` / etc.).
   Owns `ENT:Draw` (just `DrawModel` so halo.Render works) and
   `ENT:DrawHologram` (stencil + GPU clip prism setup, scene matrix
@@ -48,7 +42,11 @@ entities, static props, radar markers, and players are GPU-clipped via a
   `PostDrawTranslucentRenderables` dispatch hook. That hook exists only
   while at least one `holo_table_3d` exists and loops with
   `ipairs(ents.FindByClass('holo_table_3d'))`. `include`s
-  `sh_controls.lua`, `cl_map.lua`, `cl_radar.lua` at the top.
+  `sh_controls.lua`, `cl_effects.lua`, `cl_map.lua`, `cl_radar.lua` at the top.
+- `lua/entities/holo_table_3d/cl_effects.lua` and `effects/*.lua` — optional
+  visual-effect subsystem. Owns default-off style cvars, per-table shader
+  constants, shared IMesh draw state, and cached custom-material wrappers.
+  The prototype styles worldspawn plus baked static and stable dynamic props.
 - `lua/entities/holo_table_3d/cl_map.lua` — ordered include shim for the
   map subsystem. The implementation lives in `map/cl_map_*.lua`; shared
   cross-fragment internals live on `ENT.MapCache`, while entity-facing hooks
@@ -68,8 +66,8 @@ entities, static props, radar markers, and players are GPU-clipped via a
   `RadarBase` with `GetEntity` / `GetScale` (returns the *inverse*
   scale) / `GetOrigin` / `GetAngles` / `Project`, and ENT hooks
   `InitializeRadar` / `ThinkRadar` / `DrawRadar` / `CleanupRadar`.
-  `DrawRadar` stages the BSP→world transform on `self._radar*` fields
-  once per frame so each module's `Draw` can `Project` cheaply.
+  `ENT:UpdateHologramTransform` stages the shared BSP→world transform on
+  `self._holo*` fields once per frame so each module can `Project` cheaply.
 - `lua/entities/holo_table_3d/radar/*.lua` — one file per tracked
   entity kind. Defines a `RADAR` table populated with any subset of
   `Initialize` / `Think` / `Draw` / `OnRemove`; the loader sets
@@ -80,19 +78,24 @@ entities, static props, radar markers, and players are GPU-clipped via a
   `other_vehicle.lua` (LFS / SW vehicles, red marker spheres),
   `player.lua` (live player/weapon models; remote players are drawn by
   temporarily projecting the real entity, while the local player uses a
-  clientside mirror with copied bones). `prop_dynamic.lua` is now
-  a stub only; map-owned `prop_dynamic` dressing lives in
-  `map/cl_map_dynamic_props.lua`.
+  clientside mirror with copied bones). `prop_dynamic` is not a radar
+  module; map-owned dressing lives in `map/cl_map_dynamic_props.lua`.
 - `lua/entities/holo_table_3d/sh_controls.lua` — interactive control
   layer: `+use`-toggled grab, `CreateMove`-driven WASD pan / wheel
   height / `+speed`+wheel zoom / `+reload` recenter /
   `+speed`+`+reload` table-focus / `+duck` precision modifier /
-  T entities / G map, throttled `setparams` send, immediate
-  `setlayers` / `autocenter` / `focus_table` send, HUD overlay with
+  H power / T entities / G map, throttled `setparams` send, immediate
+  `setlayers` / `setpower` / `autocenter` / `focus_table` send, HUD overlay with
   dynamic key labels via `input.LookupBinding`, `holo_table_release`
   / `holo_table_autocenter` / `holo_table_focus_table` concommands.
   Table-focus snaps to scale `8` and height `28`, centered on the
   physical table's map position.
+  The server branch owns `SIMPLE_USE`, controller/disconnect cleanup, and all
+  seven control net messages. Incoming mutations are ownership-checked and
+  clamped to the NetworkVar limits.
+- `lua/entities/holo_table_3d/sh_power.lua` — authoritative server-side
+  power audio: startup/shutdown one-shots, spatial hum lifecycle, and sound
+  volume/enable cvars.
 - `DESIGN.md` — design decisions, alternatives considered/rejected,
   deferred-work list. **Read this before changing anything non-trivial.**
 - The old monolithic `lua/entities/holo_table_3d.lua` was deleted;
@@ -137,13 +140,12 @@ entities, static props, radar markers, and players are GPU-clipped via a
     `other_vehicle.lua` (LFS / SW vehicles, red marker spheres),
     `player.lua` (live player/weapon models; remote players draw their
     real entity at a temporary projected pose, local player uses a
-    `ClientsideModel` mirror). `prop_dynamic.lua`
-    later became a stub; map dressing moved to
-    `map/cl_map_dynamic_props.lua`.
+    `ClientsideModel` mirror). The former `prop_dynamic.lua` module was
+    removed after map dressing moved to `map/cl_map_dynamic_props.lua`.
     Model-based drawers still need to run outside the `m2` matrix
     block because `Entity:DrawModel` ignores `cam.PushModelMatrix`;
-    `ENT:DrawRadar` stages the BSP→world transform on `self._radar*`
-    so each module can `Project` cheaply without recomputing.
+    `ENT:UpdateHologramTransform` stages the shared transform on
+    `self._holo*` so each module can `Project` cheaply without recomputing.
 13. Material loading robustness:
     - `loadTexdataMaterial(name)` strips a stray leading `/` from
       BSP texdata paths (e.g. `/FIRSTORDERBANNER`) which would
@@ -204,7 +206,7 @@ entities, static props, radar markers, and players are GPU-clipped via a
       `focus_table` uses scale `8`, pan = the table entity's world
       `x/y`, and height `28` so the surrounding floor remains visible
       in the close tactical view.
-      `holo_table_profile` lives in `cl_map.lua` with its own
+      `holo_table_profile` lives in `map/cl_map_tools.lua` with its own
       `findAutoCenterTarget` (crosshair → nearest); the duplication
       is intentional — the dev tool stays decoupled from the control
       module.
@@ -213,8 +215,9 @@ entities, static props, radar markers, and players are GPU-clipped via a
     `InitializeRadar` / `ThinkRadar` / `DrawRadar` / `CleanupRadar`),
     and the entire map subsystem (clipper, brush mesh cache, prop
     cache, async build pipeline, draw entry points, `ComputeAutoCenter`,
-    `holo_table_profile`) into `cl_map.lua` (hooks `InitializeMap` /
-    `CleanupMap`). `cl_init.lua` is now ~410 lines and only owns
+    `holo_table_profile`) behind `cl_map.lua` (hooks `InitializeMap` /
+    `CleanupMap`), later split into `map/cl_map_*.lua`. `cl_init.lua` now
+    owns
     lifecycle dispatch, `Draw` (just `DrawModel`), and `DrawHologram`
     (stencil + GPU clip prism setup, scene matrix push, async-build
     kick) plus the lifecycle-gated `PostDrawTranslucentRenderables`
@@ -394,6 +397,359 @@ entities, static props, radar markers, and players are GPU-clipped via a
     holo-table radar. The radar can still gain optional headroom later
     with marker-only / tracer-only modes, but that will not fix the
     measured 50 ms spikes.
+36. Source-comment cleanup. Long implementation/performance narratives were
+    removed from Lua files in favor of this handoff and `DESIGN.md`. Public
+    methods and non-trivial helpers now use concise LuaLS `---` docs with
+    typed `@param` / `@return` tags and colon-form `@see` method references.
+37. Venator 3-FPS diagnosis and prop-bake memory pass. A GC-paused hook probe
+    found `PostDrawSkyBox / NAI_Aurora_3D` allocating about 23.9 MB per frame;
+    temporarily removing that hook changed a five-second sample from roughly
+    446 ms/frame to 4.47 ms/frame. Its source (`lua/autorun/client/nai_aurora.lua`)
+    destroys and regenerates four curtain meshes every skybox draw. The
+    immediate workaround is `r_aurora_3d 0`; this is external to the holo
+    table. Separately, prop bakes now use packed eight-number vertex buffers,
+    process one model/skin mesh set at a time, reuse smaller-scale bakes for
+    larger scales, and release shared bakes when the final table is removed.
+    A complete 1,399,365-vertex Venator static bake added about 211 MB during
+    construction, versus about 573 MB for the old representation before it
+    had reached one million vertices. (A short-lived
+    `holo_table_staticprop_partial_bake_max_props` limit that sent dense
+    partial views to the legacy renderer was removed: it froze gm_mall2 on
+    spawn. See DESIGN.md.)
+38. Radar visibility and idle-lifecycle pass. Players, LVS mirrors, and other
+    vehicle markers now sphere-cull against the current BSP-space cylinder
+    before model animation/drawing. On a scale-36 Venator view where the local
+    player was outside the selected area, player radar dropped from about
+    0.21 ms / 3.97 KB per pass to 0.011 ms / 0.09 KB. A visible all-in player
+    retained full bone-pose rendering while allocation fell to about 0.48 KB
+    per pass. Numeric bodygroup iteration, reusable protected-call helpers,
+    and persistent weapon attachment remove avoidable visible-player work.
+    The LVS `util.Effect` interceptor is now installed only while at least one
+    LVS radar instance exists, and final-table cleanup also cancels unfinished
+    map prewarm coroutines. Reused clipped-map matrix/vector scratch and named
+    protected mesh emitters reduced `DrawClippedMap` and baked-dynamic drawing
+    to zero measurable Lua allocation in the final probe; the complete all-in
+    `DrawHologram` measured about 0.66 ms and 21.9 KB per pass.
+39. Multi-table steady-frame pass. Four adjacent, visible scale-263 Venator
+    tables exposed a roughly 64 ms draw frame even though their normal
+    combined addon CPU cost was about 1.6 ms. A GC-paused probe measured about
+    84 KB of holo draw allocation per rendered frame: each table independently
+    fetched the same live brush-entity positions and angles. Brush pose results
+    are now cached on the shared brush record for one `FrameNumber`, preserving
+    full-rate doors/trains while letting later tables reuse them. The same
+    four-table probe fell to about 35 KB/frame (58% lower); over a subsequent
+    15-second sample, combined draw CPU averaged about 1.55 ms and peaked at
+    4.14 ms, with no repeat of the 60 ms-class collector stall. LVS and other-
+    vehicle source discovery is also shared at 15 Hz instead of scanning every
+    world entity once per table. Their average per-instance Think costs fell
+    from about 0.047/0.166 ms to 0.014/0.063 ms respectively. Finally,
+    baked-dynamic fallback refreshes iterate the watcher's small `unbaked`
+    EntIndex set rather than repeating a full entity scan for every table.
+40. Multi-table render modes and GPU-clip prototype. Visible tables now share
+    one stencil clear session and use distinct reference values instead of
+    clearing before and after every table (`holo_table_stencil_batch`, default
+    `1`). `holo_table_radar_lod 1` replaces player/LVS model miniatures with
+    cheap team-colored spheres; mode `0` keeps full models and mode `2` turns
+    radar drawing off. In the four-table scale-263 Venator sample, stencil
+    batching moved average frame time from 4.211 to 4.077 ms and addon draw CPU
+    from 1.648 to 1.492 ms. Marker radar reached 3.662 ms / 0.913 ms addon CPU.
+    `holo_table_benchmark [seconds]` now runs repeatable baseline, stencil,
+    marker, shader, and render-off phases while restoring the user's cvars.
+    An experimental compiled `screenspace_general` shader can clip the cached
+    all-in world mesh to the true cylinder for partial views
+    (`holo_table_shader_clip 1`). It is default-off: applying it to all-in
+    views was slower in the sample, so the runtime only uses it to avoid a
+    partial software rebuild when an `AllInMeshes` cache already exists.
+41. Optional stylized effect prototype. `cl_effects.lua` and `effects/*.lua`
+    isolate a default-off worldspawn shader with tint/source-texture mix,
+    scanlines, a scrolling scan band, height contours, Fresnel-style rim,
+    procedural noise, short glitches, and opacity controls. It uses the same
+    exact GPU cylinder/floor rejection as the clip prototype and falls
+    back to the normal map after a material/draw failure. The benchmark now
+    has a sixth `stylized_effect` phase. Live Venator testing confirmed the
+    compiled shader/material path draws without console errors. That test also
+    fixed both custom shader wrappers to create against a known texture and
+    bind the BSP adapter's existing `ITexture`; adapter texture names are not
+    reliably loadable material paths. A follow-up visual report exposed two
+    discard bugs: the effect was imposing an unintended top cap on the
+    open-topped worldspawn mesh and treating opaque texture alpha (often an
+    envmap/self-illum mask) as coverage. Software-clipped meshes now bypass
+    shader clipping, exact clipping uses only the cylinder/floor, opaque alpha
+    is ignored, and source no-cull state is preserved. The remaining full-mesh
+    failure was stale ambient-cube constants: `render.SetModelLighting` stages
+    values, but a bare IMesh draw does not upload them. The effect subsystem
+    now draws one shared zero-scale client model after staging constants, as
+    required by the custom-shader guide; live on/off screenshots then retained
+    the same Venator geometry.
+42. Baked prop effect coverage. `effects/cl_effects_draw.lua` now owns the
+    guarded shader draw state and replacement-material IMesh loop shared by
+    worldspawn, static-prop bakes, and stable `prop_dynamic` bakes. Prop draws
+    use exact cylinder/floor rejection and fall back to their ordinary
+    materials on failure. `holo_table_effect_props` defaults to `1` and can
+    isolate this coverage from the master effect. Materials without a
+    `$basetexture` use debug white rather than disabling the entire effect.
+    Live `rp_finalizer` validation observed one frame's three effect lists as
+    82 world, 2 static-prop, and 52 dynamic-prop meshes (497,025 dynamic
+    vertices): 85 effect materials were active, the effect remained ready,
+    and no draw errors were reported. Per-prop cull mode was also exercised.
+43. Live brush effect coverage and GShader HBAO diagnosis. Cached BSP brush
+    entity IMeshes now use the shared effect path by default, independently
+    toggleable with `holo_table_effect_brushes`. The installed HBAO addon was
+    applying its multiply pass from `PostBumpDraw` during `PreDrawEffects`,
+    after the holotable's translucent draw, so opaque-world AO showed through
+    hologram pixels. HBAO's built-in `pp_hbao_translucent 1` mode moves that
+    pass to `PostDrawReconstructionEffects`, before the holotable; use that
+    setting rather than duplicating the entire hologram after post-processing.
+    Live `rp_finalizer` validation found 118 brush entities and observed 80
+    brush effect-list calls in the visible cylinder; the effect remained ready
+    without a fallback. HBAO was moved to the earlier hook successfully.
+44. Translucent effect depth fix. The shared effect batch originally forced
+    depth writes for every material. A live hangar shield using
+    `effects/com_shield002a` therefore hid players and later hologram layers
+    even though its color remained translucent. Effect materials now return
+    their source coverage class to the draw helper: translucent surfaces keep
+    depth testing but disable depth writes, while opaque / alpha-tested
+    surfaces retain writable depth. Each mesh list restores writable depth
+    before returning so state cannot leak into the next brush or map layer.
+    The same report exposed a second property of the hangar shield:
+    `effects/com_shield002a` is an `UnlitTwoTexture` material with both
+    `$translucent` and `$additive`. Replacement materials now preserve the
+    additive flag and include it in their cache key; otherwise the normally
+    faint emissive shield becomes a dense alpha-blended hologram sheet.
+    Live on/off captures then confirmed that material/depth flags alone were
+    insufficient: the projected player and vehicle disappeared only when the
+    brush effect was enabled. Brush effects are therefore split into an early
+    opaque pass and a late translucent/additive pass after `DrawRadar`. This
+    preserves normal opaque occlusion while guaranteeing that shield surfaces
+    composite over, rather than reject, player and vehicle holograms.
+45. Tactical radar-contact pass. `effects/cl_effects_contacts.lua` adds a
+    shared presentation layer for players and vehicles. The initial
+    `models/wireframe` overlay looked like a debug view and did not match the
+    map. Full-detail player/weapon/LVS models now render once through the same
+    filled scanline/rim/noise/glitch shader as the map. Per-submaterial wrappers
+    retain source textures/alpha classes and enable `$model` plus
+    `$softwareskin`, while existing ambient-cube constants supply team tint and
+    animation values. Projected contacts also receive table-oriented ground
+    rings, vertical locator beams, and glow caps. Player colors distinguish
+    local/friendly/hostile/neutral contacts; LVS uses its existing `AITEAM`
+    relationship colors; marker-only non-LVS vehicles remain red. The feature
+    follows `holo_table_effects` and is independently controlled by
+    `holo_table_effect_contacts`,
+    `holo_table_effect_contact_models`, and
+    `holo_table_effect_contact_markers`, with opacity/speed tuning cvars. No
+    HLSL or `.vcs` file changed, so this pass hot-reloads without a restart. A
+    single cached 144-vertex ring IMesh is transformed once per contact rather
+    than issuing one `render.DrawBeam` call per circle segment.
+    LVS contacts also materialize during the latter part of the map startup
+    instead of appearing immediately: stable per-entity staggering, a short
+    opacity flicker/scale ramp, and a contracting ring/growing locator beam all
+    share one reveal scalar. Newly detected ships use the same acquisition
+    envelope. `holo_table_effect_contact_materialize_time` and
+    `holo_table_effect_contact_stagger` expose the two timing controls.
+    Live testing created 13 player/weapon material wrappers, drew both models
+    through `screenspace_general_dx9`, and exercised one marker without a
+    fallback. A temporary scale-8 table-focus capture confirmed the animated
+    filled model visually; the exact prior table view was restored afterward.
+    `holo_table_radar_reload` now
+    calls the freshly included definition closures directly, because existing
+    entity userdata can retain its previous method table during a manual
+    include even though the new radar registry loaded successfully.
+46. Expanded presentation pass. Moving and legacy client-model map props now
+    use the same filled shader as baked props through cached `$model` /
+    `$softwareskin` wrappers, so moving doors/dressing do not visually drop out
+    of the effect. Contacts gained independently toggleable acquisition pings,
+    close-view labels, and bounded fading vehicle trails. Trail samples retain
+    their last fixed position until the entity has moved 48 source units;
+    mutating that sample every radar tick prevented normal movement from ever
+    accumulating the threshold. Table-wide atmosphere lives in
+    `effects/cl_effects_atmosphere.lua`: eight sparse additive edge columns, a
+    cached emitter ring, and a rotating two-beam sweep replaced an initial
+    continuous translucent cylinder that looked like a gray curtain. New
+    The original `holo_table_effect_power` presentation cvar and
+    `holo_table_effect_sequence_time` eased a shared per-table reveal value.
+    The recompiled effect shader performs a
+    height/noise materialization dissolve with a bright leading edge; CPU-side
+    contact and atmosphere layers follow the same reveal, and fully powered-off
+    effect batches skip mesh submission. `holo_table_effect_replay` restarts
+    startup. Both HLSL programs compiled successfully, but their reused shader
+    names mean Garry's Mod must restart before visual validation. Live Lua
+    validation compiled all 13 touched files, exercised the power state at
+    1.000 -> 0.432 -> 0.000 and back, built three legacy prop-model wrappers,
+    and produced no render errors. The exact prior scale/height/pan and all
+    temporary cvars were restored; `sv_allowcslua` remained `0`.
+47. Atmosphere visibility and hot-refresh repair. Live testing confirmed
+    `DrawAtmosphere` was running about 20 times per second with every cvar
+    enabled, but its `+25.2` base sat beneath the physical table top/stencil
+    surface around `+26`; opaque table depth therefore hid it regardless of
+    the strength setting. The emitter is now based at `+26.6`, with wider
+    sweep/column beams and readable default alpha. Captures at both strength
+    `0.28` and `0.7` show the pulsing edge ring, eight light columns, rotating
+    sweep, and endpoint glow. Lua auto-refresh also exposed delayed cleanup
+    destroying a tiny ring IMesh still referenced by an active closure.
+    Contact and atmosphere rings now retain old generations for garbage
+    collection and resolve the current global mesh at draw time; a failed
+    contact-ring draw warns once instead of aborting player radar every frame.
+    Full live reload and a quiet console capture passed. No shader changed, so
+    this repair needs no restart.
+48. The first visible atmosphere pass read as generic sci-fi radar rather than
+    the table's Star Wars hologram language: a bright continuous rim, eight
+    fence-like columns, and a radial sweep competed with the map. It was
+    replaced with low-profile broken cyan emitter glyphs, two counter-rotating
+    data arcs, a soft expanding scan pulse, and eight short irregular projector
+    nodes. The flat UI was lifted to `+27.8` so inner arcs are not buried in the
+    table/grid depth. The existing atmosphere strength and sweep-speed cvars
+    remain compatible; sweep speed now controls glyph rotation. This is a Lua
+    and material-layout change, so it hot-loads without a game restart.
+49. Atmosphere was simplified again around the requested physical projector
+    read. The broken rings, rotating data arcs, scan pulse, and emitter nodes
+    were removed. The active table now has a breathing cyan inner-rim glow made
+    from 32 short beam segments plus one very low-alpha, upward-fading projector
+    shaft. Live iteration rejected a conical IMesh because its overlapping
+    sides became bright polygon sheets in Source's translucent pass. The beam
+    version has no persistent atmosphere IMesh, hot-refreshes cleanly, and uses
+    the existing strength cvar; `holo_table_effect_sweep_speed` now adjusts the
+    breathing rate. No compiled shader changed, so no restart is required.
+50. The geometry-based atmosphere was removed after the broad beam remained
+    visibly camera-facing. `effects/cl_effects_volume.lua` now hooks GShader's
+    `PostDrawReconstructionEffects` stage and draws only when `shaderlib`,
+    `_rt_WPDepth`, `r_shaderlib`, and depth reconstruction are available.
+    `holotable_volume_ps30` decodes GShader's reciprocal world position,
+    intersects each view ray with a tapered radius-82, height-44 projection
+    volume, stops at opaque scene depth, and integrates six fixed samples for
+    a soft core, source ring, cone edge, restrained scan signal, and slow
+    pulse. Every table draw uses a conservative screen scissor. The old beam
+    file and `DrawHologram` atmosphere submission were removed; installations
+    without GShader intentionally show no decorative atmosphere rather than a
+    lower-quality fallback. The new shader compiled successfully and the live
+    installed GShader build accepted its material and hook. A test capture at
+    strength `1` showed depth-aware blue haze without the previous central
+    billboard flare; the archived strength was restored to `0.28`. Because the
+    compiled shader was subsequently tuned under the same name, restart GMod
+    before judging the final intensity.
+51. The first depth-aware pass was technically correct but read as smooth blue
+    fog disconnected from its source and hologram. The volume now rises `58`
+    units, narrows from radius `82` to 58%, has a dimmer center and clearer
+    boundary, and uses eight fixed angular emitter lobes instead of a uniform
+    source ring. Rare short height-band interruptions add restrained signal
+    instability. The same GShader pass derives opaque normals from derivatives
+    of reconstructed world position and adds short-range pulsing light spill
+    to the physical rim/table without depending on GShader's configurable
+    normal encoding. `holotable_effect_ps20b` now adds synchronized underlight
+    to hologram fragments from `-5` through `+18` units around the emitter base;
+    `C3.w` carries the shared atmosphere animation-rate adjustment. Both the
+    Shader Model 3 volume and Shader Model 2b material shader compiled cleanly.
+    Their reused names require a full GMod restart before visual validation.
+52. The volume frustum was reversed after its inward taper read more like a
+    containment field than projected light. The density shape now begins at
+    82% of the radius-82 emitter and expands to 108% at its 58-unit top. The
+    analytic bounding cylinder and Lua screen-space bounding sphere both use
+    the wider top radius, preventing the outward projection from being clipped.
+53. Live feedback exposed a second radius mismatch: the outward cone began at
+    `0.82 * 82` while opaque emitter spill was centered near `0.965 * 82`.
+    `ProjectorRadius` is now an editable per-table Float NetworkVar with range
+    `60`–`100` and default `86`. Its exact value drives the opaque spill ring,
+    volume source ring, and cone base; the cone expands to 122% at the top.
+    Dynamic screen bounds and the analytic cylinder use the same current value.
+    Existing entities with an uninitialized zero value fall back to `86`, and
+    the Properties slider updates all pieces live without a shader restart.
+54. The outward cone still read like a translucent physical shell because its
+    density used a hard inside step plus a strong narrow edge contribution.
+    `holo_table_effect_cone_softness` now defaults to `0.72` and independently
+    widens the radial density falloff from 5.5% to 32% while reducing the edge
+    highlight toward a low haze value. The Shader Model 3 pass now hardcodes
+    its already-fixed height of `58`, freeing `c2.w` for live softness without
+    disturbing the emitter hotspots or opaque light spill. Atmosphere strength
+    remains the overall intensity control.
+55. Real table power, audio, and spawn fit. `Powered` is now a per-entity Bool
+    NetworkVar and the source of truth for the existing reveal sequence. A
+    powered-off table completes its shutdown dissolve, then skips hologram
+    rendering; client radar polling also pauses. `Shift+E` toggles the aimed-at
+    table directly, `H` toggles it in control mode, the editable Properties
+    panel exposes it, and `holo_table_power [0/1]` targets the controlled,
+    aimed-at, or nearest table. `sh_power.lua` owns spatial startup/shutdown
+    one-shots and a looping hum, with archived replicated
+    `holo_table_sound` / `holo_table_sound_volume` controls and explicit
+    removal cleanup. New tables call the same shared Fit Map calculation using
+    server world-model bounds instead of the old Venator-specific
+    scale/height defaults; the manual autocenter path still uses parsed BSP
+    bounds. No shader changed in this pass.
+56. LVS high-poly radar mitigation. Runtime-spawned `prop_dynamic` entities
+    (`MapCreationID() < 0`) are now excluded from both the map-dressing bake and
+    its mirror fallback, preventing LVS visual children such as the 733,416-
+    vertex Z-95 child from being duplicated into the map layer. LVS mirrors
+    force authored LOD 8. `effects/cl_effects_proxy.lua` classifies that LOD
+    once per model/bodygroup configuration: cheap authored LODs remain animated
+    native models, while pathological models are vertex-clustered in a 3 ms-
+    budgeted coroutine into a shared static 3D proxy and persisted beneath
+    `data/holo_table/radar_proxies`. Native contacts now default to one light
+    `UnlitGeneric` hologram override; the old full per-material shader remains
+    available through `holo_table_effect_contact_full_shader 1`. Live results:
+    Droid Tri-Fighter LOD 8 = 2,592 vertices (native); Z-95 = 542,952 input
+    vertices reduced to 6,939-7,410 triangles depending on bodygroups. With six
+    proxies and six native contacts active, a five-second sample averaged 10.0
+    ms/frame (100 FPS, 17.21 ms p95), versus the earlier effect-on isolation at
+    roughly 42.24 ms/frame. No compiled shader changed, so no restart is needed.
+57. Vehicle LOD follow-up fixes. Native Tri-Fighters disappeared because the
+    lightweight `UnlitGeneric` requested vertex-color/alpha streams that their
+    model does not provide; the v2 material now relies only on render color
+    modulation and was visually verified at authored LOD 8. Z-95 proxies faced
+    90 degrees sideways because `util.GetModelMeshes` raw studio coordinates
+    precede the engine's model-axis conversion. Raw/OBB comparisons on both
+    vehicle models established the mapping `model = (-rawY, rawX, rawZ)`.
+    Proxy cache version 3 applies it to positions and normals before clustering,
+    forcing old incorrectly oriented disk entries to rebuild. No shader restart.
+58. Contact shader, silhouette, and lighting pass. Native contacts now use a
+    dedicated Shader Model 2b path with source-alpha-preserving wrappers; cached
+    proxies use the same scan-slice/rim/materialization pixel shader with one
+    texture-free material. A second optional draw expands optimized contact
+    geometry by a fixed screen-pixel width for a soft silhouette halo instead
+    of allocating and blurring a per-table mask. Contacts also publish projected
+    position/tint/radius into the existing GShader reconstruction hook. It draws
+    at most four independently scissored, normal-aware opaque light pools per
+    table. Live validation used 12 tracked ARC-170s plus the player. The first
+    contact-light build exposed invalid empty-depth reciprocals as white scissor
+    rectangles; explicit packed-depth, range, and derivative-normal validation
+    removed them. All four shader programs compiled cleanly and live materials
+    bound without error. The short AI-active A/B frame sample was too noisy and
+    phase-ordered to support a performance claim, so the cap and cvars remain.
+59. Player/generic-contact parity and depth intersections. Neutral player model
+    fills now use the map's real hologram tint while their marker graphics keep
+    the softer tactical color. The non-LVS radar was upgraded from fixed red
+    spheres to synced clientside mirrors using the same authored-LOD/proxy,
+    reveal, shader, halo, ring, ping, and label paths as LVS. The new
+    `holotable_contactdepth2` Shader Model 2b pair packs clip-space position into
+    existing varyings and samples the alpha depth written by
+    `render.UpdateFullScreenDepthTexture` after the projected map. It softens the
+    visible side of contact/map occlusion and adds a narrow tint-colored
+    intersection frontier. The built-in depth copy is independent of GShader
+    and can be disabled with `holo_table_effect_contact_occlusion 0`; softness
+    and edge strength are separately tunable. Runtime materials use a new shader
+    name, so this development session hot-loaded it without restarting.
+60. Contact radiance correction. Dark studio textures no longer dim contact
+    fill down to near-black: `holotable_contactradiance` uses a higher emission
+    floor, reduced source-color mixing, and an independent
+    `holo_table_effect_contact_brightness` control (default `1.2`). Native models
+    and proxies share the correction. `holotable_contactglow` fixes the halo's
+    double attenuation (intensity had been applied in both RGB and alpha) and
+    broadens its soft Fresnel falloff without adding draw passes. The local
+    player's body now uses the map tint instead of its cyan marker accent.
+    Both new SM2b pixel shaders compiled successfully; the MCP endpoint was
+    offline, so live visual validation remains pending.
+61. Soft contact glow and live brightness validation. MCP was available again;
+    the live proxy material initially read zero brightness/opacity despite the
+    configured brightness being `1.2`. Proxy material creation is now deferred
+    until drawing and readback detects an engine-reset settings cache. Neutral
+    contact draws were verified to upload `102/159/255`; the local player's ring
+    now follows the neutral blue palette too instead of using a cyan accent. The new
+    `effects/cl_effects_glow.lua` tags accepted contact fragments in stencil bit
+    128, extracts their rendered color, blurs once per shared stencil batch, and
+    adds light outside the silhouettes without another geometry submission.
+    The body is excluded from the additive composite to preserve its blue.
+    `holo_table_effect_contact_bloom`, `*_bloom_strength`, and `*_bloom_blur`
+    control this optional screen-copy/blur work. Batched and unbatched paths
+    were exercised live; screenshots confirmed a visible proxy and unchanged
+    surrounding map. No shader binary changed in this pass and no restart was
+    needed. This is a visual improvement, not a measured performance win.
 
 ## Profiling baselines
 
@@ -467,6 +823,22 @@ visible table, scale 270):
   LVS radar did not remove 50 ms-class real-frame spikes. Treat those
   spikes as mostly outside this addon unless a future profiler shows
   different alignment.
+- After the hybrid vehicle LOD/proxy pass, the live 12-contact scene contained
+  six cached Z-95 proxies and six native authored-LOD contacts. A five-second
+  sample averaged 10.0 ms/frame (100 FPS) with a 17.21 ms p95. The earlier
+  effect-on isolation of the same general battle measured about 42.24 ms/frame;
+  view and combat state can vary, so treat this as a live end-to-end result,
+  not a portable constant.
+- Current Venator collapse: the holo-table hook measured about 33 KB/frame,
+  while the external `NAI_Aurora_3D` skybox hook measured about 23.9 MB/frame.
+  With only that hook temporarily removed, 908 frames averaged 4.47 ms with
+  no frame over 50 ms. Use `r_aurora_3d 0` to disable its 3D curtain path.
+- Four adjacent scale-263 tables before cross-table pose sharing averaged
+  about 1.63 ms combined draw CPU and allocated about 84 KB per rendered
+  frame; one sampled draw frame stalled for 64 ms. After sharing brush poses
+  and radar discovery, combined draw CPU averaged about 1.55 ms, allocation
+  was about 35 KB/frame, and the worst addon frame in a 15-second sample was
+  4.14 ms.
 
 **Steady-state Lua allocation notes** (GC paused, one visible spawned
 table on the current test map):
@@ -495,12 +867,14 @@ Current likely next work:
    show order artifacts.
 2. **Brush entity cost.** With static props and `prop_dynamic` baked,
    `DrawBrushEntities` is often the next meaningful per-frame cost on
-   Venator-like maps. Potential work: separate static `func_brush` /
+   Venator-like maps. Multiple tables now share each brush entity's pose for
+   the frame, but still repeat culling and GPU draw submission. Potential work:
+   separate static `func_brush` /
    stable brush entities from moving doors/trains and bake the stable
    subset, leaving live brush entities on the current matrix path.
-3. **Spatial baked-prop chunks if mode 3 clips badly.** The current
-   default draws the full static-prop bake in zoomed views and relies on
-   the 5-plane GPU clip prism. It is fast, but if visuals show props
+3. **Spatial baked-prop chunks if mode 3 clips badly.** Below the partial-view
+   prop-count safety limit, mode `3` draws the full static-prop bake in zoomed
+   views and relies on the 5-plane GPU clip prism. It is fast, but if visuals show props
    poking beyond the intended cylinder edge, the next candidate is
    material-grouped spatial chunks. The per-prop baked cull experiment
    was measured and is too draw-call-heavy for dense maps.
@@ -508,6 +882,11 @@ Current likely next work:
    IMesh and only re-clip the few boundary faces on parameter change.
    Bigger refactor; only worth it if rebuild hitches during edits are
    still visible after prewarm/bake work.
+5. **Projector-volume tuning.** GShader now supplies the optional depth-aware
+   volume while the ordinary Source path covers the hologram materials,
+   contacts, and power sequencing. Tune density/height/radius from live reports
+   after a restart. Nearby surface light spill using GShader normals is a later
+   optional pass only if the volume itself fits the table's visual language.
 
 ## Pinned facts (don't relitigate)
 
@@ -526,9 +905,10 @@ Current likely next work:
 - Static prop bake modes: `holo_table_staticprop_bake_mode 0` = legacy
   csent path, `1` = global bake only when horizontally all-in, `2` =
   per-prop baked cull experiment, `3` = default global bake clipped by
-  the GPU prism in all static-prop views. Mode `3` is the measured fast
-  zoom path; mode `2` exists for comparison but is not the preferred
-  optimisation.
+  the GPU prism on every map. While any bake builds, the baked path draws
+  the previous ready bake or nothing -- never the legacy csent renderer,
+  which is unbounded on dense maps. Mode `3` is the measured fast zoom path;
+  mode `2` exists for comparison but is not the preferred optimisation.
 - `Entity:DrawModel` ignores `cam.PushModelMatrix`. Legacy static and
   `prop_dynamic` fallback paths draw csents in world space using a
   precomputed `tableOrigin + R * (p / scale)` transform; baked static
@@ -571,9 +951,8 @@ Current likely next work:
   loop ships it to clients automatically. No edits to `cl_init.lua` /
   `cl_radar.lua` / `init.lua` needed.
 - `prop_dynamic` is intentionally **not** a tracked radar kind anymore.
-  `radar/prop_dynamic.lua` is a stub to keep loader behaviour stable;
-  map-owned dynamic dressing bake/fallback lives in
-  `map/cl_map_dynamic_props.lua`.
+  The former `radar/prop_dynamic.lua` module was removed; map-owned dynamic
+  dressing bake/fallback lives in `map/cl_map_dynamic_props.lua`.
 - Player radar has two paths. Remote players temporarily draw the real
   entity/weapon at the projected pose and restore it immediately. The
   local player uses a persistent `ClientsideModel` mirror plus a weapon
@@ -694,10 +1073,12 @@ Workflow conventions:
   hand-wavy "this should be much faster" — give numbers when claiming
   perf wins, and ask for the next `holo_table_profile` output to
   confirm.
-- Use `<augment_code_snippet>` with `mode="EXCERPT"` and four backticks
-  when showing code. Keep snippets <10 lines.
 - Don't commit, push, or restructure files without asking. Don't create
   new docs unless explicitly requested (this file was requested).
-- When making edits, gather context first (codebase-retrieval / view)
-  and respect the existing comment style — terse intent comments,
-  no rationale-as-comments.
+- When making edits, gather context first and respect the existing comment
+  style: inline `--` comments explain only non-obvious intent in 1-2 lines;
+  longer rationale belongs in this file or `DESIGN.md`.
+- Document methods and non-trivial helpers with LuaLS comments beginning
+  `--- ` (including the space). Keep prose to 1-3 lines, add `@param` and
+  `@return` types where useful, and use colon-form `@see` targets for methods
+  (for example `--- @see ENT:DrawHologram`).

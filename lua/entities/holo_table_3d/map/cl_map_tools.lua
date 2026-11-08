@@ -1,7 +1,3 @@
-local math_sqrt = math.sqrt
-local math_max = math.max
-local math_ceil = math.ceil
-
 --- Fits the worldspawn AABB inside the cylinder. Pads the half-diagonal
 --- ~5%, lands the BSP floor 1 unit above the table top to avoid z-fighting.
 --- @return number? scale
@@ -13,23 +9,7 @@ function ENT:ComputeAutoCenter()
     if not bsp or not bsp.models or not bsp.models[1] then return end
     local m = bsp.models[1]
 
-    local centerX = (m.mins.x + m.maxs.x) * 0.5
-    local centerY = (m.mins.y + m.maxs.y) * 0.5
-    local halfDX = (m.maxs.x - m.mins.x) * 0.5
-    local halfDY = (m.maxs.y - m.mins.y) * 0.5
-
-    local needRadius = math_sqrt(halfDX * halfDX + halfDY * halfDY) * 1.05
-    local scale = math_max(1, math_ceil(needRadius / 90))
-
-    -- Lands BSP mins.z (lowest map face along table-up) on the table top
-    -- plus 1 unit clearance to dodge the floor clip plane.
-    local axis = self:GetUp()
-    local pivotZ = self:GetPos():Dot(axis)
-    local minsAlong = m.mins:Dot(axis)
-    local clearance = 1
-    local height = 25 + clearance - (minsAlong - pivotZ) / scale
-
-    return scale, centerX, centerY, height
+    return self:ComputeMapFitFromBounds(m.mins, m.maxs)
 end
 
 
