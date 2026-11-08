@@ -42,11 +42,9 @@ local function drawPlayerAndWeapon(ply, radar, modelColor, phase)
     end
 
     local wep = ply:GetActiveWeapon()
-    if IsValid(wep) then
-        if not HoloEffects.DrawContactModel(radar.entityTable, wep,
+    if IsValid(wep) and not HoloEffects.DrawContactModel(radar.entityTable, wep,
             modelColor, phase + 0.35) then
-            wep:DrawModel()
-        end
+        wep:DrawModel()
     end
 end
 

@@ -315,9 +315,10 @@ function ENT:DrawBrushEntities(translucentPass)
     end
     if atlasStaged then MapCache.atlasEndUnclipped() end
 
-    if effectActive and not HoloEffects.EndDraw(effectOk, effectErr) then
-        -- MarkFailed disables the effect, so this retry takes the ordinary
-        -- material path and leaves the map dressing visible this frame.
-        if not translucentPass then self:DrawBrushEntities(false) end
+    -- EndDraw must run whenever the effect was begun, so it comes before
+    -- the pass check. MarkFailed disables the effect, so the retry takes
+    -- the ordinary material path and leaves the map dressing visible.
+    if effectActive and not HoloEffects.EndDraw(effectOk, effectErr) and not translucentPass then
+        self:DrawBrushEntities(false)
     end
 end

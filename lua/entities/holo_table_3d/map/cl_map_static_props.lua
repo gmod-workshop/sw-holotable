@@ -1,6 +1,5 @@
 local MapCache = ENT.MapCache
 local SysTime = SysTime
-local Vector = Vector
 local Material = Material
 local math_atan2 = math.atan2
 local math_sqrt = math.sqrt
